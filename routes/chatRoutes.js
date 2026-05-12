@@ -17,6 +17,7 @@ router.post("/", protect, async (req, res) => {
   try {
     const senderPhone = req.user?.phone;
     const { receiverPhone } = req.body;
+    console.log("test from chatroute");
 
     if (!senderPhone) throw new Error("senderPhone missing from JWT");
     if (!receiverPhone) return res.status(400).json({ error: "receiverPhone is required" });
