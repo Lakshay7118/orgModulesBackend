@@ -4,6 +4,7 @@ const Contact = require("../models/Contact");
 const Template = require("../models/Template");
 const Message = require("../models/Message");
 const Chat = require("../models/chat");
+const CampaignDelivery = require("../models/CampaignDelivery");
 const { getIO } = require("../sockets/socket");
 
 function normalizePhone(phone) {
@@ -43,34 +44,35 @@ function getCampaignDeliveryKey(campaign, campaignRunKey, recipientPhone) {
   return `${campaign._id}:${campaignRunKey}:${recipientPhone}`;
 }
 
-async function createCampaignMessageOnce(messageData) {
-  const filter = { campaignDeliveryKey: messageData.campaignDeliveryKey };
-
+async function reserveCampaignDelivery(lockData) {
   try {
-    const result = await Message.findOneAndUpdate(
-      filter,
-      { $setOnInsert: messageData },
-      {
-        upsert: true,
-        new: true,
-        setDefaultsOnInsert: true,
-        includeResultMetadata: true,
-      }
-    );
+    const delivery = await CampaignDelivery.create({
+      _id: lockData.campaignDeliveryKey,
+      campaignId: lockData.campaignId,
+      campaignRunKey: lockData.campaignRunKey,
+      recipientPhone: lockData.recipientPhone,
+      chatId: lockData.chatId,
+      status: "processing",
+    });
 
-    const msg = result?.value || result;
-    const created =
-      result?.lastErrorObject?.updatedExisting === false ||
-      Boolean(result?.lastErrorObject?.upserted);
-
-    return { msg, created };
+    return { reserved: true, delivery };
   } catch (err) {
-    if (err?.code === 11000) {
-      const msg = await Message.findOne(filter);
-      return { msg, created: false };
-    }
-    throw err;
+    if (err?.code !== 11000) throw err;
+
+    const existing = await CampaignDelivery.findById(lockData.campaignDeliveryKey).lean();
+    return { reserved: false, delivery: existing };
   }
+}
+
+async function markCampaignDeliverySent(campaignDeliveryKey, messageId) {
+  await CampaignDelivery.findByIdAndUpdate(campaignDeliveryKey, {
+    status: "sent",
+    messageId,
+  });
+}
+
+async function releaseCampaignDelivery(campaignDeliveryKey) {
+  await CampaignDelivery.findByIdAndDelete(campaignDeliveryKey);
 }
 
 function resolveTemplateText(templateText, variableValues, contact) {
@@ -140,9 +142,23 @@ async function sendMessageToContact(contact, campaign, io) {
     return { msg: existingMessage, created: false };
   }
 
+  const reservation = await reserveCampaignDelivery({
+    campaignDeliveryKey,
+    campaignId: campaign._id,
+    campaignRunKey,
+    recipientPhone,
+    chatId: chat._id,
+  });
+
+  if (!reservation.reserved) {
+    console.log("Skipping duplicate campaign delivery:", campaign._id, recipientPhone);
+    return { created: false };
+  }
+
   const template = await Template.findById(campaign.templateId).lean();
   if (!template) {
     console.error("❌ Template not found:", campaign.templateId);
+    await releaseCampaignDelivery(campaignDeliveryKey);
     return;
   }
 
@@ -175,24 +191,26 @@ async function sendMessageToContact(contact, campaign, io) {
     carouselItems: template.carouselItems || [],
   };
 
-  const { msg, created } = await createCampaignMessageOnce({
-    chatId: chat._id,
-    sender: creatorPhone,
-    campaignId: campaign._id,
-    campaignRunKey,
-    recipientPhone,
-    campaignDeliveryKey,
-    text: resolvedBody,
-    messageType: "template",
-    status: "delivered",
-    deliveredAt: new Date(),
-    templateMeta,
-    readBy: [],
-  });
-
-  if (!created) {
-    console.log("Skipping duplicate campaign delivery:", campaign._id, recipientPhone);
-    return { msg, created: false };
+  let msg;
+  try {
+    msg = await Message.create({
+      chatId: chat._id,
+      sender: creatorPhone,
+      campaignId: campaign._id,
+      campaignRunKey,
+      recipientPhone,
+      campaignDeliveryKey,
+      text: resolvedBody,
+      messageType: "template",
+      status: "delivered",
+      deliveredAt: new Date(),
+      templateMeta,
+      readBy: [],
+    });
+    await markCampaignDeliverySent(campaignDeliveryKey, msg._id);
+  } catch (err) {
+    await releaseCampaignDelivery(campaignDeliveryKey);
+    throw err;
   }
 
   await Chat.findByIdAndUpdate(chat._id, {
@@ -233,6 +251,19 @@ async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creato
   if (existingMessage) {
     console.log("Skipping duplicate group campaign delivery:", campaign._id, groupChat._id);
     return { msg: existingMessage, created: false };
+  }
+
+  const reservation = await reserveCampaignDelivery({
+    campaignDeliveryKey,
+    campaignId: campaign._id,
+    campaignRunKey,
+    recipientPhone,
+    chatId: groupChat._id,
+  });
+
+  if (!reservation.reserved) {
+    console.log("Skipping duplicate group campaign delivery:", campaign._id, groupChat._id);
+    return { created: false };
   }
 
   const template = await Template.findById(campaign.templateId).lean();
@@ -284,24 +315,26 @@ async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creato
   };
 
   // ✅ Save message to the GROUP chat (not 1-on-1)
-  const { msg, created } = await createCampaignMessageOnce({
-    chatId: groupChat._id,
-    sender: creatorPhone,
-    campaignId: campaign._id,
-    campaignRunKey,
-    recipientPhone,
-    campaignDeliveryKey,
-    text: resolvedBody,
-    messageType: "template",
-    status: "delivered",
-    deliveredAt: new Date(),
-    templateMeta,
-    readBy: [],
-  });
-
-  if (!created) {
-    console.log("Skipping duplicate group campaign delivery:", campaign._id, groupChat._id);
-    return { msg, created: false };
+  let msg;
+  try {
+    msg = await Message.create({
+      chatId: groupChat._id,
+      sender: creatorPhone,
+      campaignId: campaign._id,
+      campaignRunKey,
+      recipientPhone,
+      campaignDeliveryKey,
+      text: resolvedBody,
+      messageType: "template",
+      status: "delivered",
+      deliveredAt: new Date(),
+      templateMeta,
+      readBy: [],
+    });
+    await markCampaignDeliverySent(campaignDeliveryKey, msg._id);
+  } catch (err) {
+    await releaseCampaignDelivery(campaignDeliveryKey);
+    throw err;
   }
 
   // ✅ Update group chat lastMessage

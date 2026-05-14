@@ -135,12 +135,4 @@ fileUrl:  { type: String, default: null },
   }
 );
 
-MessageSchema.index(
-  { campaignDeliveryKey: 1 },
-  {
-    unique: true,
-    partialFilterExpression: { campaignDeliveryKey: { $type: "string" } },
-  }
-);
-
 module.exports = mongoose.models.Message || mongoose.model("Message", MessageSchema);
