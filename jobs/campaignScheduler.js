@@ -39,6 +39,40 @@ function getTemplateLastMessage(msg, sender) {
 }
 
 // 🔥 SAFE TEMPLATE RESOLVER
+function getCampaignDeliveryKey(campaign, campaignRunKey, recipientPhone) {
+  return `${campaign._id}:${campaignRunKey}:${recipientPhone}`;
+}
+
+async function createCampaignMessageOnce(messageData) {
+  const filter = { campaignDeliveryKey: messageData.campaignDeliveryKey };
+
+  try {
+    const result = await Message.findOneAndUpdate(
+      filter,
+      { $setOnInsert: messageData },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true,
+        includeResultMetadata: true,
+      }
+    );
+
+    const msg = result?.value || result;
+    const created =
+      result?.lastErrorObject?.updatedExisting === false ||
+      Boolean(result?.lastErrorObject?.upserted);
+
+    return { msg, created };
+  } catch (err) {
+    if (err?.code === 11000) {
+      const msg = await Message.findOne(filter);
+      return { msg, created: false };
+    }
+    throw err;
+  }
+}
+
 function resolveTemplateText(templateText, variableValues, contact) {
   if (!templateText) return "";
   let text = String(templateText);
@@ -78,6 +112,7 @@ async function sendMessageToContact(contact, campaign, io) {
   const targetPhone = contact.mobile || contact.phone;
   const campaignRunKey = getCampaignRunKey(campaign);
   const recipientPhone = normalizePhone(targetPhone);
+  const campaignDeliveryKey = getCampaignDeliveryKey(campaign, campaignRunKey, recipientPhone);
 
   if (!creatorPhone || !targetPhone) {
     console.error("❌ Missing phone:", { creatorPhone, targetPhone });
@@ -97,10 +132,7 @@ async function sendMessageToContact(contact, campaign, io) {
   }
 
   const existingMessage = await Message.findOne({
-    campaignId: campaign._id,
-    campaignRunKey,
-    chatId: chat._id,
-    recipientPhone,
+    campaignDeliveryKey,
   });
 
   if (existingMessage) {
@@ -143,12 +175,13 @@ async function sendMessageToContact(contact, campaign, io) {
     carouselItems: template.carouselItems || [],
   };
 
-  const msg = await Message.create({
+  const { msg, created } = await createCampaignMessageOnce({
     chatId: chat._id,
     sender: creatorPhone,
     campaignId: campaign._id,
     campaignRunKey,
     recipientPhone,
+    campaignDeliveryKey,
     text: resolvedBody,
     messageType: "template",
     status: "delivered",
@@ -156,6 +189,11 @@ async function sendMessageToContact(contact, campaign, io) {
     templateMeta,
     readBy: [],
   });
+
+  if (!created) {
+    console.log("Skipping duplicate campaign delivery:", campaign._id, recipientPhone);
+    return { msg, created: false };
+  }
 
   await Chat.findByIdAndUpdate(chat._id, {
     lastMessage: "📋 Template",
@@ -187,11 +225,9 @@ async function sendMessageToContact(contact, campaign, io) {
 async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creatorPhone) {
   const campaignRunKey = getCampaignRunKey(campaign);
   const recipientPhone = `group:${groupChat._id}`;
+  const campaignDeliveryKey = getCampaignDeliveryKey(campaign, campaignRunKey, recipientPhone);
   const existingMessage = await Message.findOne({
-    campaignId: campaign._id,
-    campaignRunKey,
-    chatId: groupChat._id,
-    recipientPhone,
+    campaignDeliveryKey,
   });
 
   if (existingMessage) {
@@ -248,12 +284,13 @@ async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creato
   };
 
   // ✅ Save message to the GROUP chat (not 1-on-1)
-  const msg = await Message.create({
+  const { msg, created } = await createCampaignMessageOnce({
     chatId: groupChat._id,
     sender: creatorPhone,
     campaignId: campaign._id,
     campaignRunKey,
     recipientPhone,
+    campaignDeliveryKey,
     text: resolvedBody,
     messageType: "template",
     status: "delivered",
@@ -261,6 +298,11 @@ async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creato
     templateMeta,
     readBy: [],
   });
+
+  if (!created) {
+    console.log("Skipping duplicate group campaign delivery:", campaign._id, groupChat._id);
+    return { msg, created: false };
+  }
 
   // ✅ Update group chat lastMessage
   await Chat.findByIdAndUpdate(groupChat._id, {
@@ -316,6 +358,18 @@ function getNextRunTime(lastRun, recurrence) {
 // 🔥 MAIN CRON FUNCTION
 async function processCampaigns() {
   const now = new Date();
+  const staleProcessingBefore = new Date(now.getTime() - 5 * 60 * 1000);
+
+  await Campaign.updateMany(
+    {
+      status: "processing",
+      processingStartedAt: { $lte: staleProcessingBefore },
+    },
+    {
+      $set: { status: "scheduled" },
+      $unset: { processingStartedAt: "" },
+    }
+  );
 
   const campaigns = await Campaign.find({
     status: "scheduled",

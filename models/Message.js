@@ -27,6 +27,7 @@ const MessageSchema = new mongoose.Schema(
     },
     campaignRunKey: { type: String, default: null },
     recipientPhone: { type: String, default: null },
+    campaignDeliveryKey: { type: String, default: null },
 
     messageType: {
       type: String,
@@ -131,6 +132,14 @@ fileUrl:  { type: String, default: null },
   {
     timestamps: true,
     strict: true, // Mongoose default — explicit here for clarity
+  }
+);
+
+MessageSchema.index(
+  { campaignDeliveryKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { campaignDeliveryKey: { $type: "string" } },
   }
 );
 
