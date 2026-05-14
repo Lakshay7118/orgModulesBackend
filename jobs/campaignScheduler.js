@@ -546,8 +546,11 @@ console.log(`✅ Campaign ${campaign._id} done | run #${campaign.runCount} | sen
 }
 
 // ⏱ Run every 10 seconds
-cron.schedule("*/10 * * * * *", () => {
-  processCampaigns().catch(console.error);
-});
+if (!global.__campaignSchedulerStarted) {
+  global.__campaignSchedulerStarted = true;
+  cron.schedule("*/10 * * * * *", () => {
+    processCampaigns().catch(console.error);
+  });
+}
 
 module.exports = { processCampaigns };

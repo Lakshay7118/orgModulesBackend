@@ -2,6 +2,7 @@ const mongoose = require("mongoose");
 const CampaignSchema = new mongoose.Schema(
   {
     campaignName: { type: String, required: true, trim: true },
+    launchKey: { type: String, default: null },
 
     messageType: {
       type: String,
