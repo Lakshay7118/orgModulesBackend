@@ -8,6 +8,51 @@ const UserTaskStatus = require("../models/UserTaskStatus");
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 
+const TASK_UPDATE_FIELDS = [
+  "title", "description", "dueDate", "reminderAt", "priority",
+  "attachments", "inputFields", "dropdownButtons", "quickReplies",
+  "ctaButtons", "checkboxes", "assignedTo", "isPersonal",
+];
+
+const pickTaskUpdates = (body) => {
+  const updates = {};
+  TASK_UPDATE_FIELDS.forEach((field) => {
+    if (body[field] !== undefined) updates[field] = body[field];
+  });
+  return updates;
+};
+
+const broadcastTaskAssignmentChanges = async (task, previousAssigneeIds, io) => {
+  const newAssigneeIds = task.assignedTo.map((user) => user._id.toString());
+  const removedAssigneeIds = previousAssigneeIds.filter((uid) => !newAssigneeIds.includes(uid));
+  const addedAssignees = task.assignedTo.filter((user) => !previousAssigneeIds.includes(user._id.toString()));
+
+  removedAssigneeIds.forEach((uid) => {
+    io.to(uid).emit("taskDeleted", { taskId: task._id });
+  });
+
+  if (removedAssigneeIds.length > 0) {
+    await UserTaskStatus.deleteMany({
+      taskId: task._id,
+      userId: { $in: removedAssigneeIds },
+    });
+  }
+
+  [...new Set([task.createdBy._id.toString(), ...newAssigneeIds])].forEach((uid) => {
+    io.to(uid).emit("taskUpdated", task);
+  });
+
+  for (const user of addedAssignees) {
+    const notif = await Notification.create({
+      userId: user._id,
+      type: "task_assigned",
+      message: `New task assigned: ${task.title}`,
+      taskId: task._id,
+    });
+    io.to(user._id.toString()).emit("newNotification", notif);
+  }
+};
+
 // =======================
 // ✅ GET ALL USERS (for assign dropdown)
 // =======================
@@ -44,6 +89,7 @@ router.get("/", protect, async (req, res) => {
       .populate("createdBy", "name phone role")
       .populate("assignedTo", "name phone role")
       .populate("responses.userId", "name phone role")
+      .populate("pendingUpdate.requestedBy", "name phone role")
       .sort({ createdAt: -1 });
 
     res.json({ success: true, data: tasks });
@@ -192,11 +238,40 @@ router.patch("/:id/approve", protect, allowRoles("super_admin"), async (req, res
     const task = await Task.findById(req.params.id)
       .populate("createdBy", "name phone role")
       .populate("assignedTo", "name phone role")
-      .populate("responses.userId", "name phone role");
+      .populate("responses.userId", "name phone role")
+      .populate("pendingUpdate.requestedBy", "name phone role");
 
     if (!task) return res.status(404).json({ error: "Task not found" });
     if (task.approvalStatus !== "pending") {
       return res.status(400).json({ error: "Task is not pending approval" });
+    }
+
+    const isUpdateRequest = !!task.pendingUpdate?.changes;
+
+    if (approvalStatus === "rejected" && isUpdateRequest) {
+      const io = getIO();
+      const requesterId = task.pendingUpdate.requestedBy || task.createdBy._id;
+
+      task.pendingUpdate = { requestedBy: null, changes: null, requestedAt: null };
+      task.approvalStatus = "approved";
+      await task.save();
+
+      const populatedTask = await Task.findById(task._id)
+        .populate("createdBy", "name phone role")
+        .populate("assignedTo", "name phone role")
+        .populate("responses.userId", "name phone role")
+        .populate("pendingUpdate.requestedBy", "name phone role");
+
+      const notif = await Notification.create({
+        userId: requesterId,
+        type: "task_rejected",
+        message: `Your edit request for "${task.title}" was rejected by admin`,
+        taskId: task._id,
+      });
+      io.to(requesterId.toString()).emit("newNotification", notif);
+      io.to(requesterId.toString()).emit("taskUpdated", populatedTask);
+
+      return res.json({ success: true, data: populatedTask, message: "Task edit rejected" });
     }
 
     if (approvalStatus === "rejected") {
@@ -218,13 +293,19 @@ router.patch("/:id/approve", protect, allowRoles("super_admin"), async (req, res
     }
 
     // ── Approved ─────────────────────────────────────────────────
+    const previousAssigneeIds = task.assignedTo.map((id) => id.toString());
+    if (isUpdateRequest) {
+      Object.assign(task, task.pendingUpdate.changes);
+      task.pendingUpdate = { requestedBy: null, changes: null, requestedAt: null };
+    }
     task.approvalStatus = "approved";
     await task.save();
 
     const populatedTask = await Task.findById(task._id)
       .populate("createdBy", "name phone role")
       .populate("assignedTo", "name phone role")
-      .populate("responses.userId", "name phone role");
+      .populate("responses.userId", "name phone role")
+      .populate("pendingUpdate.requestedBy", "name phone role");
 
     const io = getIO();
 
@@ -232,11 +313,16 @@ router.patch("/:id/approve", protect, allowRoles("super_admin"), async (req, res
     const approvedNotif = await Notification.create({
       userId: task.createdBy._id,
       type: "task_approved",
-      message: `Your task "${task.title}" was approved`,
+      message: isUpdateRequest ? `Your edit request for "${task.title}" was approved` : `Your task "${task.title}" was approved`,
       taskId: task._id,
     });
     io.to(task.createdBy._id.toString()).emit("newNotification", approvedNotif);
     io.to(task.createdBy._id.toString()).emit("taskUpdated", populatedTask);
+
+    if (isUpdateRequest) {
+      await broadcastTaskAssignmentChanges(populatedTask, previousAssigneeIds, io);
+      return res.json({ success: true, data: populatedTask });
+    }
 
     // Now notify assignees — task is live
     for (const assignee of populatedTask.assignedTo) {
@@ -274,26 +360,85 @@ router.put("/:id", protect, allowRoles("super_admin", "manager"), async (req, re
       return res.status(403).json({ error: "Not authorized" });
     }
 
-    const allowedUpdates = [
-      "title", "description", "dueDate", "reminderAt", "priority",
-      "attachments", "inputFields", "dropdownButtons", "quickReplies",
-      "ctaButtons", "checkboxes",
-    ];
-    const updates = {};
-    allowedUpdates.forEach((field) => {
-      if (req.body[field] !== undefined) updates[field] = req.body[field];
-    });
+    const updates = pickTaskUpdates(req.body);
+    const previousAssigneeIds = task.assignedTo.map((id) => id.toString());
+
+    if (!isAdmin && task.approvalStatus === "pending" && !task.pendingUpdate?.changes) {
+      Object.assign(task, updates);
+      await task.save();
+
+      const populatedTask = await Task.findById(task._id)
+        .populate("createdBy", "name phone role")
+        .populate("assignedTo", "name phone role")
+        .populate("responses.userId", "name phone role")
+        .populate("pendingUpdate.requestedBy", "name phone role");
+
+      const io = getIO();
+      const admins = await User.find({ role: "super_admin" }).select("_id").lean();
+      admins.forEach((admin) => {
+        io.to(admin._id.toString()).emit("taskUpdated", populatedTask);
+      });
+      io.to(req.user.id).emit("taskUpdated", populatedTask);
+
+      return res.json({
+        success: true,
+        data: populatedTask,
+        pendingApproval: true,
+        message: "Pending task request updated",
+      });
+    }
+
+    if (!isAdmin) {
+      task.pendingUpdate = {
+        requestedBy: req.user.id,
+        changes: updates,
+        requestedAt: new Date(),
+      };
+      task.approvalStatus = "pending";
+      await task.save();
+
+      const populatedTask = await Task.findById(task._id)
+        .populate("createdBy", "name phone role")
+        .populate("assignedTo", "name phone role")
+        .populate("responses.userId", "name phone role")
+        .populate("pendingUpdate.requestedBy", "name phone role");
+
+      const io = getIO();
+      const admins = await User.find({ role: "super_admin" }).select("_id").lean();
+      const creator = await User.findById(req.user.id).select("name").lean();
+      for (const admin of admins) {
+        const notif = await Notification.create({
+          userId: admin._id,
+          type: "approval_requested",
+          message: `${creator.name} submitted a task edit for approval: "${task.title}"`,
+          taskId: task._id,
+        });
+        io.to(admin._id.toString()).emit("newNotification", notif);
+        io.to(admin._id.toString()).emit("taskUpdated", populatedTask);
+      }
+      io.to(req.user.id).emit("taskUpdated", populatedTask);
+
+      return res.json({
+        success: true,
+        data: populatedTask,
+        pendingApproval: true,
+        message: "Task edit sent for admin approval",
+      });
+    }
+
+    if (task.pendingUpdate?.changes) {
+      updates.pendingUpdate = { requestedBy: null, changes: null, requestedAt: null };
+      updates.approvalStatus = "approved";
+    }
 
     const updatedTask = await Task.findByIdAndUpdate(req.params.id, updates, { new: true })
       .populate("createdBy", "name phone role")
       .populate("assignedTo", "name phone role")
-      .populate("responses.userId", "name phone role");
+      .populate("responses.userId", "name phone role")
+      .populate("pendingUpdate.requestedBy", "name phone role");
 
     const io = getIO();
-    updatedTask.assignedTo.forEach((user) => {
-      io.to(user._id.toString()).emit("taskUpdated", updatedTask);
-    });
-    io.to(updatedTask.createdBy._id.toString()).emit("taskUpdated", updatedTask);
+    await broadcastTaskAssignmentChanges(updatedTask, previousAssigneeIds, io);
 
     res.json({ success: true, data: updatedTask });
   } catch (error) {

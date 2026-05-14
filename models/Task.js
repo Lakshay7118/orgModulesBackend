@@ -87,6 +87,11 @@ const TaskSchema = new mongoose.Schema(
   enum: ["pending", "approved", "rejected"],
   default: "approved",
 },
+    pendingUpdate: {
+      requestedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+      changes: { type: mongoose.Schema.Types.Mixed, default: null },
+      requestedAt: { type: Date, default: null },
+    },
     checkboxes: [
       {
         id: String,

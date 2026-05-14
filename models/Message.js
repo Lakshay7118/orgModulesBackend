@@ -18,6 +18,8 @@ const MessageSchema = new mongoose.Schema(
       required: true,
     },
 
+    clientTempId: { type: String, default: null },
+
     messageType: {
       type: String,
       enum: ["text", "image", "video", "audio", "file", "template","contact"],

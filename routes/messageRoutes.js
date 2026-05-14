@@ -63,6 +63,7 @@ router.post("/", protect, async (req, res) => {
   contactName,
   contactPhone,
   contactEmail,
+  clientTempId,
 } = req.body;
 
     let resolvedTemplateMeta = null;
@@ -135,6 +136,7 @@ router.post("/", protect, async (req, res) => {
    const msg = await Message.create({
   chatId,
   sender,
+  clientTempId: clientTempId || null,
   text: text || "",
   messageType: messageType || "text",
   fileUrl,
@@ -144,24 +146,28 @@ router.post("/", protect, async (req, res) => {
   contactName: contactName || null,
   contactPhone: contactPhone || null,
   contactEmail: contactEmail || null,
-  status: "sent",
+  status: "delivered",
+  deliveredAt: new Date(),
   readBy: [],
 });
 
     // ================= UPDATE CHAT =================
     let lastMessageText = text;
+    if (messageType === "video") lastMessageText = "Video";
+    if (messageType === "audio") lastMessageText = "Audio";
     if (messageType === "image") lastMessageText = "📷 Photo";
     if (messageType === "file") lastMessageText = `📎 ${fileName || "File"}`;
     if (messageType === "template") lastMessageText = "📋 Template";
 
    await Chat.findByIdAndUpdate(chatId, {
   lastMessage: {
-    text: text || "",
+    text: lastMessageText || "",
     messageType: messageType || "text",
     fileName: fileName || null,
     createdAt: msg.createdAt,
     sender: sender,
     isDeleted: false,
+    status: msg.status,
   },
   updatedAt: new Date(),
   $set: { deletedBy: [] },

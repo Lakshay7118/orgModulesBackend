@@ -15,6 +15,9 @@ const NotificationSchema = new mongoose.Schema(
         "campaign_approval_requested", "campaign_approved", "campaign_rejected",
         // Contact
         "contact_approval_requested", "contact_approved", "contact_rejected",
+        // Settings
+        "profile_approval_requested", "profile_approved", "profile_rejected",
+        "support_ticket_created", "support_ticket_replied",
       ],
       required: true,
     },
