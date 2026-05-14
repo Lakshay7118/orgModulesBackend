@@ -20,6 +20,14 @@ const MessageSchema = new mongoose.Schema(
 
     clientTempId: { type: String, default: null },
 
+    campaignId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Campaign",
+      default: null,
+    },
+    campaignRunKey: { type: String, default: null },
+    recipientPhone: { type: String, default: null },
+
     messageType: {
       type: String,
       enum: ["text", "image", "video", "audio", "file", "template","contact"],

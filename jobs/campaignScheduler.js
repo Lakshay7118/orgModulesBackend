@@ -6,6 +6,38 @@ const Message = require("../models/Message");
 const Chat = require("../models/chat");
 const { getIO } = require("../sockets/socket");
 
+function normalizePhone(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  return digits.length > 10 ? digits.slice(-10) : digits;
+}
+
+function getCampaignRunKey(campaign) {
+  const runDate = campaign.nextRun || campaign.scheduledDateTime || campaign.createdAt || new Date();
+  return new Date(runDate).toISOString();
+}
+
+function dedupeRecipientsByPhone(recipients) {
+  const seen = new Set();
+  return recipients.filter((recipient) => {
+    const key = normalizePhone(recipient.mobile || recipient.phone);
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function getTemplateLastMessage(msg, sender) {
+  return {
+    text: "Template",
+    messageType: "template",
+    fileName: null,
+    createdAt: msg.createdAt,
+    sender,
+    isDeleted: false,
+    status: msg.status,
+  };
+}
+
 // 🔥 SAFE TEMPLATE RESOLVER
 function resolveTemplateText(templateText, variableValues, contact) {
   if (!templateText) return "";
@@ -43,11 +75,13 @@ function resolveTemplateText(templateText, variableValues, contact) {
 // 🔥 SEND MESSAGE TO 1-ON-1 CHAT (for tags/contacts/manual)
 async function sendMessageToContact(contact, campaign, io) {
   const creatorPhone = campaign.createdBy?.phone || campaign.createdBy?.mobile;
-  const targetPhone = contact.mobile;
+  const targetPhone = contact.mobile || contact.phone;
+  const campaignRunKey = getCampaignRunKey(campaign);
+  const recipientPhone = normalizePhone(targetPhone);
 
   if (!creatorPhone || !targetPhone) {
     console.error("❌ Missing phone:", { creatorPhone, targetPhone });
-    return;
+    return { created: false };
   }
 
   let chat = await Chat.findOne({
@@ -60,6 +94,18 @@ async function sendMessageToContact(contact, campaign, io) {
   if (!chat) {
     chat = await Chat.create({ participants: [creatorPhone, targetPhone] });
     console.log("✅ New chat created:", chat._id);
+  }
+
+  const existingMessage = await Message.findOne({
+    campaignId: campaign._id,
+    campaignRunKey,
+    chatId: chat._id,
+    recipientPhone,
+  });
+
+  if (existingMessage) {
+    console.log("Skipping duplicate campaign delivery:", campaign._id, recipientPhone);
+    return { msg: existingMessage, created: false };
   }
 
   const template = await Template.findById(campaign.templateId).lean();
@@ -100,10 +146,13 @@ async function sendMessageToContact(contact, campaign, io) {
   const msg = await Message.create({
     chatId: chat._id,
     sender: creatorPhone,
+    campaignId: campaign._id,
+    campaignRunKey,
+    recipientPhone,
     text: resolvedBody,
     messageType: "template",
-    status: "sent",
-    sentAt: new Date(),
+    status: "delivered",
+    deliveredAt: new Date(),
     templateMeta,
     readBy: [],
   });
@@ -130,12 +179,26 @@ async function sendMessageToContact(contact, campaign, io) {
   });
 
   console.log("📡 Emitted to room:", String(chat._id), "| creator:", creatorPhone, "| recipient:", targetPhone);
-  return msg;
+  return { msg, created: true };
 }
 
 // 🔥 NEW: SEND MESSAGE TO GROUP CHAT DIRECTLY
 // One message visible to ALL members inside the group
 async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creatorPhone) {
+  const campaignRunKey = getCampaignRunKey(campaign);
+  const recipientPhone = `group:${groupChat._id}`;
+  const existingMessage = await Message.findOne({
+    campaignId: campaign._id,
+    campaignRunKey,
+    chatId: groupChat._id,
+    recipientPhone,
+  });
+
+  if (existingMessage) {
+    console.log("Skipping duplicate group campaign delivery:", campaign._id, groupChat._id);
+    return { msg: existingMessage, created: false };
+  }
+
   const template = await Template.findById(campaign.templateId).lean();
   if (!template) {
     console.error("❌ Template not found:", campaign.templateId);
@@ -188,10 +251,13 @@ async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creato
   const msg = await Message.create({
     chatId: groupChat._id,
     sender: creatorPhone,
+    campaignId: campaign._id,
+    campaignRunKey,
+    recipientPhone,
     text: resolvedBody,
     messageType: "template",
-    status: "sent",
-    sentAt: new Date(),
+    status: "delivered",
+    deliveredAt: new Date(),
     templateMeta,
     readBy: [],
   });
@@ -218,7 +284,7 @@ async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creato
   });
 
   console.log(`📡 Emitted to GROUP room: ${groupChat._id} | Group: "${groupName}" | Members: ${groupChat.participants.length}`);
-  return msg;
+  return { msg, created: true };
 }
 
 // ⏱ NEXT RUN TIME CALCULATOR
@@ -263,7 +329,26 @@ async function processCampaigns() {
 
   const io = getIO();
 
-  for (const campaign of campaigns) {
+  for (const dueCampaign of campaigns) {
+    const campaign = await Campaign.findOneAndUpdate(
+      {
+        _id: dueCampaign._id,
+        status: "scheduled",
+        approvalStatus: "approved",
+        nextRun: { $lte: now },
+      },
+      {
+        $set: {
+          status: "processing",
+          processingStartedAt: new Date(),
+          errorLog: "",
+        },
+      },
+      { new: true }
+    ).populate("createdBy", "phone name");
+
+    if (!campaign) continue;
+    let runSentCount = 0;
     console.log("📤 Running campaign:", campaign._id, "| Creator:", campaign.createdBy?.phone);
 
     if (!campaign.createdBy) {
@@ -308,8 +393,8 @@ async function processCampaigns() {
 
         try {
           // ✅ ONE message to the group chat — visible to all members
-          await sendMessageToGroupChat(groupChat, campaign, io, groupName, creatorPhone);
-          campaign.sentCount += 1;
+          const result = await sendMessageToGroupChat(groupChat, campaign, io, groupName, creatorPhone);
+          if (result?.created) runSentCount += 1;
           console.log(`✅ Sent to group "${groupName}"`);
         } catch (err) {
           console.error(`❌ Failed for group "${groupName}":`, err.message);
@@ -326,10 +411,16 @@ async function processCampaigns() {
     }
 
     // ── SEND (tags / contacts / manual) ──
+    recipients = dedupeRecipientsByPhone(recipients);
+
     if (!groupHandled) {
       if (recipients.length === 0) {
         console.warn("⚠️ No recipients for campaign:", campaign._id);
         campaign.status = "sent";
+        campaign.sentCount = 0;
+        campaign.lastSentCount = 0;
+        campaign.lastRunAt = new Date();
+        campaign.processingStartedAt = null;
         await campaign.save();
         continue;
       }
@@ -338,8 +429,8 @@ async function processCampaigns() {
 
       for (const contact of recipients) {
         try {
-          await sendMessageToContact(contact, campaign, io);
-          campaign.sentCount += 1;
+          const result = await sendMessageToContact(contact, campaign, io);
+          if (result?.created) runSentCount += 1;
         } catch (err) {
           console.error("❌ Send failed for:", contact.mobile, "|", err.message);
         }
@@ -352,11 +443,15 @@ if (campaign.recurrence?.type && campaign.recurrence.type !== "one-time") {
   campaign.nextRun = getNextRunTime(campaign.nextRun, campaign.recurrence);
   campaign.status = "scheduled";
   campaign.runCount = (campaign.runCount || 0) + 1;        // ✅ track how many times it ran
-  campaign.lastSentCount = campaign.sentCount;              // ✅ save this run's count before reset
+  campaign.lastSentCount = runSentCount;
   campaign.sentCount = 0;                                   // reset for next run
 } else {
   campaign.status = "sent";
+  campaign.sentCount = runSentCount;
+  campaign.lastSentCount = runSentCount;
 }
+campaign.lastRunAt = new Date();
+campaign.processingStartedAt = null;
 
 await campaign.save();
 console.log(`✅ Campaign ${campaign._id} done | run #${campaign.runCount} | sent: ${campaign.lastSentCount}`);

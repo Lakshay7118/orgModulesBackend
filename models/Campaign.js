@@ -75,6 +75,8 @@ const CampaignSchema = new mongoose.Schema(
 
     nextRun: { type: Date },
     sentCount: { type: Number, default: 0 },
+    processingStartedAt: { type: Date, default: null },
+    lastRunAt: { type: Date, default: null },
 
     // ✅ ADD THESE TWO:
     runCount:      { type: Number, default: 0 },   // how many times this recurring campaign has fired
