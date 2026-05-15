@@ -27,6 +27,18 @@ require("./jobs/taskReminder");
 const app = express();
 const server = http.createServer(app);
 
+app.use((req, res, next) => {
+  console.log("REQ HIT:", req.method, req.originalUrl);
+  next();
+});
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    success: true,
+    message: "Backend working",
+  });
+}); 
+
 // 🔥 CORS
 app.use(cors({ origin: "*" }));
 
