@@ -19,6 +19,7 @@ const templateRoutes = require("./routes/templateRoutes");
 const campaignRoutes = require("./routes/campaignRoutes");
 const tagRoutes = require("./routes/tagRoutes");
 const taskRoutes = require("./routes/taskRoutes");
+const hrRoutes = require("./routes/hrRoutes");
 const notificationRoutes =
 require("./routes/notificationRoutes");
 require("./jobs/taskReminder");
@@ -67,6 +68,7 @@ app.use("/api", campaignRoutes);
 app.use("/api", tagRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/tasks", taskRoutes);
+app.use("/api/hr", hrRoutes);
 app.use(
   "/api/notifications",
   notificationRoutes
