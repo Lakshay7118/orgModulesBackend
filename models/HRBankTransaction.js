@@ -9,8 +9,13 @@ const HRBankTransactionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["salary", "manual_out"],
+      enum: ["salary", "manual_out", "manual_in", "loan_out", "loan_repayment", "advance_out"],
       default: "manual_out",
+    },
+    direction: {
+      type: String,
+      enum: ["in", "out"],
+      default: "out",
     },
     amount: {
       type: Number,
@@ -29,9 +34,56 @@ const HRBankTransactionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "HRPayroll",
     },
+    loan: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "HRLoan",
+    },
     paymentHistoryId: {
       type: mongoose.Schema.Types.ObjectId,
     },
+    payrollPeriodLabel: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    grossSalary: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    netPay: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    loanDeduction: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    loanOutstandingAfter: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    bankBalanceAfter: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    loanDeductions: [
+      {
+        loan: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "HRLoan",
+        },
+        amount: {
+          type: Number,
+          default: 0,
+          min: 0,
+        },
+      },
+    ],
     beneficiaryName: {
       type: String,
       trim: true,

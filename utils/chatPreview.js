@@ -17,13 +17,15 @@ const EMPTY_LAST_MESSAGE = {
 
 const getCallPreviewText = (message = {}) => {
   const status = message.callStatus || "ended";
+  const label = message.callType === "video" ? "Video call" : "Voice call";
 
-  if (status === "missed" || status === "cancelled") return "Missed voice call";
+  if (status === "missed") return `Missed ${label.toLowerCase()}`;
+  if (status === "cancelled") return `Cancelled ${label.toLowerCase()}`;
   if (status === "rejected") return "Call declined";
   if (status === "busy") return "Call busy";
   if (status === "failed") return "Call failed";
 
-  return "Voice call";
+  return label;
 };
 
 const getMessagePreviewText = (message = {}) => {

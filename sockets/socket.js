@@ -213,6 +213,7 @@ const initSocket = (server) => {
         from,
         chatId,
         reason: reason || "rejected",
+        callType: callType || "audio",
       });
 
       try {
@@ -233,6 +234,7 @@ const initSocket = (server) => {
       io.to(getPhoneRooms(to)).emit("call:busy", {
         from,
         chatId,
+        callType: callType || "audio",
       });
 
       try {
@@ -254,6 +256,7 @@ const initSocket = (server) => {
         from,
         chatId,
         reason: reason || "ended",
+        callType: callType || "audio",
       });
 
       try {

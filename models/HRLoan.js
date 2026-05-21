@@ -22,6 +22,11 @@ const HRLoanSchema = new mongoose.Schema(
       required: true,
       min: 0,
     },
+    category: {
+      type: String,
+      enum: ["loan", "advance"],
+      default: "loan",
+    },
     issueDate: {
       type: Date,
       default: Date.now,

@@ -355,7 +355,6 @@ router.get("/support-tickets", protect, async (req, res) => {
       .populate("endedBy", "name phone email role")
       .sort({ createdAt: -1 })
       .lean();
-
     res.json({ success: true, data: tickets });
   } catch (error) {
     res.status(500).json({ error: error.message });
