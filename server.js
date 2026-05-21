@@ -22,6 +22,7 @@ const taskRoutes = require("./routes/taskRoutes");
 const hrRoutes = require("./routes/hrRoutes");
 const notificationRoutes =
 require("./routes/notificationRoutes");
+const rtcRoutes = require("./routes/rtcRoutes");
 require("./jobs/taskReminder");
 
 
@@ -73,6 +74,7 @@ app.use(
   "/api/notifications",
   notificationRoutes
 );
+app.use("/api/rtc", rtcRoutes);
 
 // Test route
 app.get("/", (req, res) => {

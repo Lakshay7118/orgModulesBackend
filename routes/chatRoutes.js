@@ -4,6 +4,7 @@ const router = express.Router();
 const Chat = require("../models/chat");
 const Message = require("../models/Message");
 const enrichChat = require("../utils/enrichChat");
+const { findLastMessagePreview } = require("../utils/chatPreview");
 const { getIO } = require("../sockets/socket");
 
 const protect = require("../middleware/authMiddleware");
@@ -60,31 +61,11 @@ router.get("/", protect, async (req, res) => {
       chats.map(async (chat) => {
         const enriched = await enrichChat(chat, userPhone);
 
-        // ✅ Use stored lastMessage object OR fetch from Message collection
-        let lastMessage = chat.lastMessage;
+        const visibleLastMessage = await findLastMessagePreview(chat._id, {
+          excludeDeletedBy: userPhone,
+        });
 
-        // If lastMessage is a string (old format) or missing, fetch from DB
-        if (!lastMessage || !lastMessage.createdAt) {
-          const lastMsg = await Message.findOne({
-            chatId: chat._id,
-            deletedBy: { $ne: userPhone },
-          })
-            .sort({ createdAt: -1 })
-            .lean();
-
-          lastMessage = lastMsg
-            ? {
-                text: lastMsg.text || "",
-                messageType: lastMsg.messageType || "text",
-                fileName: lastMsg.fileName || null,
-                createdAt: lastMsg.createdAt,
-                sender: lastMsg.sender,
-                isDeleted: lastMsg.isDeleted || false,
-              }
-            : null;
-        }
-
-        return { ...enriched, lastMessage };
+        return { ...enriched, lastMessage: visibleLastMessage };
       })
     );
 

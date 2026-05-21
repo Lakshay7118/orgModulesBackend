@@ -19,9 +19,14 @@ lastMessage: {
   text:        { type: String, default: "" },
   messageType: { type: String, default: "text" },
   fileName:    { type: String, default: null },
+  contactName: { type: String, default: null },
   createdAt:   { type: Date, default: null },
   sender:      { type: String, default: null },
   isDeleted:   { type: Boolean, default: false },
+  status:      { type: String, default: null },
+  callStatus:  { type: String, default: null },
+  callDuration: { type: Number, default: 0 },
+  callType:    { type: String, default: null },
 },
 
     status: {

@@ -7,6 +7,12 @@ const Contact = require("../models/Contact");
 const Template = require("../models/Template");
 
 const resolveTemplate = require("../utils/resolveTemplate");
+const {
+  buildMessagePreview,
+  findLastMessagePreview,
+  recomputeChatLastMessage,
+  updateChatLastMessage,
+} = require("../utils/chatPreview");
 const { getIO } = require("../sockets/socket");
 
 const protect = require("../middleware/authMiddleware");
@@ -152,26 +158,8 @@ router.post("/", protect, async (req, res) => {
 });
 
     // ================= UPDATE CHAT =================
-    let lastMessageText = text;
-    if (messageType === "video") lastMessageText = "Video";
-    if (messageType === "audio") lastMessageText = "Audio";
-    if (messageType === "image") lastMessageText = "📷 Photo";
-    if (messageType === "file") lastMessageText = `📎 ${fileName || "File"}`;
-    if (messageType === "template") lastMessageText = "📋 Template";
-
-   await Chat.findByIdAndUpdate(chatId, {
-  lastMessage: {
-    text: lastMessageText || "",
-    messageType: messageType || "text",
-    fileName: fileName || null,
-    createdAt: msg.createdAt,
-    sender: sender,
-    isDeleted: false,
-    status: msg.status,
-  },
-  updatedAt: new Date(),
-  $set: { deletedBy: [] },
-});
+    await updateChatLastMessage(chatId, buildMessagePreview(msg));
+    await Chat.findByIdAndUpdate(chatId, { $set: { deletedBy: [] } });
 
     // ================= SOCKET =================
     const io = getIO();
@@ -253,15 +241,18 @@ router.delete("/:messageId", protect, async (req, res) => {
       message.templateMeta = null;
 
       await message.save();
+      const lastMessage = await recomputeChatLastMessage(message.chatId, { touch: false });
 
       getIO().to(message.chatId.toString()).emit(
         "messageDeletedForEveryone",
         {
           messageId,
           chatId: message.chatId,
+          lastMessage,
         }
       );
 
+      return res.json({ message: "Message deleted", lastMessage });
     }
 
     // 🔥 DELETE FOR ME
@@ -270,15 +261,21 @@ router.delete("/:messageId", protect, async (req, res) => {
         message.deletedBy.push(userPhone);
         await message.save();
       }
+      const lastMessage = await findLastMessagePreview(message.chatId, {
+        excludeDeletedBy: userPhone,
+      });
 
       getIO().to(userPhone).emit("messageDeletedForMe", {
         messageId,
         chatId: message.chatId,
         userPhone,
+        lastMessage,
       });
+
+      return res.json({ message: "Message deleted", lastMessage });
     }
 
-    res.json({ message: "Message deleted" });
+    res.status(400).json({ error: "Invalid delete mode" });
 
   } catch (err) {
     res.status(500).json({ error: err.message });

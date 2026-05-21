@@ -13,10 +13,14 @@ async function enrichChat(chat, currentUserPhone) {
      const unreadCount = await Message.countDocuments({
   chatId: chat._id,
   sender: { $ne: currentUserPhone },
+  deletedBy: { $ne: currentUserPhone },
   "readBy.user": { $ne: currentUserPhone }, // ✅ simple — readBy: [] always exists now
 });
 
-      const lastMsg = await Message.findOne({ chatId: chat._id })
+      const lastMsg = await Message.findOne({
+        chatId: chat._id,
+        deletedBy: { $ne: currentUserPhone },
+      })
         .sort({ createdAt: -1 });
 
       const lastMessageText =
@@ -69,10 +73,14 @@ async function enrichChat(chat, currentUserPhone) {
     const unreadCount = await Message.countDocuments({
   chatId: chat._id,
   sender: otherPhone,
+  deletedBy: { $ne: currentUserPhone },
   "readBy.user": { $ne: currentUserPhone }, // ✅ simple
 });
 
-    const lastMsg = await Message.findOne({ chatId: chat._id }).sort({
+    const lastMsg = await Message.findOne({
+      chatId: chat._id,
+      deletedBy: { $ne: currentUserPhone },
+    }).sort({
       createdAt: -1,
     });
 

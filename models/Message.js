@@ -31,7 +31,7 @@ const MessageSchema = new mongoose.Schema(
 
     messageType: {
       type: String,
-      enum: ["text", "image", "video", "audio", "file", "template","contact"],
+      enum: ["text", "image", "video", "audio", "file", "template", "contact", "call"],
       default: "text",
     },
 
@@ -45,6 +45,13 @@ const MessageSchema = new mongoose.Schema(
 contactName:  { type: String, default: null },
 contactPhone: { type: String, default: null },
 contactEmail: { type: String, default: null },
+callStatus: {
+  type: String,
+  enum: ["ended", "missed", "rejected", "busy", "cancelled", "failed", null],
+  default: null,
+},
+callDuration: { type: Number, default: 0 },
+callType: { type: String, enum: ["audio", "video", null], default: null },
 
 fileUrl:  { type: String, default: null },
     fileType: {

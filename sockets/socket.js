@@ -1,5 +1,8 @@
 // sockets/socket.js
 const { Server } = require("socket.io");
+const Chat = require("../models/chat");
+const Message = require("../models/Message");
+const { buildMessagePreview, updateChatLastMessage } = require("../utils/chatPreview");
 
 let io;
 
@@ -13,6 +16,54 @@ const getPhoneRooms = (phone) => {
   const last10 = digits.length > 10 ? digits.slice(-10) : digits;
 
   return Array.from(new Set([raw, digits, last10].filter(Boolean)));
+};
+
+const normalizeCallStatus = ({ reason, wasConnected, durationSeconds }) => {
+  if (wasConnected || durationSeconds > 0) return "ended";
+  if (reason === "busy") return "busy";
+  if (reason === "rejected") return "rejected";
+  if (reason === "connection-timeout" || reason === "remote-ended") return "missed";
+  if (reason === "setup-failed" || reason === "connection-failed" || reason === "ice-failed" || reason === "answer-failed") return "failed";
+  return "cancelled";
+};
+
+const getCallLogText = ({ callStatus, callDuration = 0, callType = "audio" }) => {
+  const label = callType === "video" ? "Video call" : "Voice call";
+
+  if (callStatus === "missed") return `Missed ${label.toLowerCase()}`;
+  if (callStatus === "rejected") return "Call declined";
+  if (callStatus === "busy") return "Call busy";
+  if (callStatus === "failed") return "Call failed";
+  if (callStatus === "cancelled") return `Cancelled ${label.toLowerCase()}`;
+  if (callDuration > 0) return label;
+
+  return label;
+};
+
+const logCallMessage = async ({ chatId, sender, callStatus, callDuration = 0, callType = "audio" }) => {
+  if (!chatId || !sender) return null;
+
+  const chat = await Chat.findById(chatId);
+  if (!chat || !chat.participants.some((phone) => String(phone) === String(sender))) {
+    return null;
+  }
+
+  const msg = await Message.create({
+    chatId,
+    sender,
+    text: getCallLogText({ callStatus, callDuration, callType }),
+    messageType: "call",
+    callStatus,
+    callDuration,
+    callType,
+    status: "delivered",
+    deliveredAt: new Date(),
+    readBy: [],
+  });
+
+  await updateChatLastMessage(chatId, buildMessagePreview(msg));
+  io.to(chatId).emit("newMessage", msg);
+  return msg;
 };
 
 const initSocket = (server) => {
@@ -155,7 +206,7 @@ const initSocket = (server) => {
       });
     });
 
-    socket.on("call:reject", ({ to, from, chatId, reason }) => {
+    socket.on("call:reject", async ({ to, from, chatId, reason, callType }) => {
       if (!to || !from) return;
 
       io.to(getPhoneRooms(to)).emit("call:rejected", {
@@ -163,18 +214,40 @@ const initSocket = (server) => {
         chatId,
         reason: reason || "rejected",
       });
+
+      try {
+        await logCallMessage({
+          chatId,
+          sender: to,
+          callStatus: "rejected",
+          callType: callType || "audio",
+        });
+      } catch (err) {
+        console.error("[call:reject] log failed:", err.message);
+      }
     });
 
-    socket.on("call:busy", ({ to, from, chatId }) => {
+    socket.on("call:busy", async ({ to, from, chatId, callType }) => {
       if (!to || !from) return;
 
       io.to(getPhoneRooms(to)).emit("call:busy", {
         from,
         chatId,
       });
+
+      try {
+        await logCallMessage({
+          chatId,
+          sender: to,
+          callStatus: "busy",
+          callType: callType || "audio",
+        });
+      } catch (err) {
+        console.error("[call:busy] log failed:", err.message);
+      }
     });
 
-    socket.on("call:end", ({ to, from, chatId, reason }) => {
+    socket.on("call:end", async ({ to, from, chatId, reason, initiator, durationSeconds, wasConnected, callType }) => {
       if (!to || !from) return;
 
       io.to(getPhoneRooms(to)).emit("call:ended", {
@@ -182,6 +255,22 @@ const initSocket = (server) => {
         chatId,
         reason: reason || "ended",
       });
+
+      try {
+        await logCallMessage({
+          chatId,
+          sender: initiator || from,
+          callStatus: normalizeCallStatus({
+            reason: reason || "ended",
+            wasConnected: Boolean(wasConnected),
+            durationSeconds: Number(durationSeconds) || 0,
+          }),
+          callDuration: Number(durationSeconds) || 0,
+          callType: callType || "audio",
+        });
+      } catch (err) {
+        console.error("[call:end] log failed:", err.message);
+      }
     });
 
     socket.on("chatDeleted", ({ chatId, userPhone }) => {
