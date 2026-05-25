@@ -185,6 +185,7 @@ router.post("/mark-read", protect, async (req, res) => {
   try {
     const { chatId } = req.body;
     const userPhone = req.user.phone;
+    const readAt = new Date();
 
     await Message.updateMany(
       {
@@ -193,12 +194,12 @@ router.post("/mark-read", protect, async (req, res) => {
         "readBy.user": { $ne: userPhone },
       },
       {
-        $push: { readBy: { user: userPhone, readAt: new Date() } },
-        status: "seen",
+        $push: { readBy: { user: userPhone, readAt } },
+        $set: { status: "seen", seenAt: readAt },
       }
     );
 
-    getIO().to(chatId).emit("messagesSeen", { chatId, user: userPhone });
+    getIO().to(chatId).emit("messagesSeen", { chatId, user: userPhone, seenAt: readAt });
 
     res.json({ success: true });
 
