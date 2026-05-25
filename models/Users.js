@@ -10,6 +10,7 @@ const UserSchema = new mongoose.Schema({
     enum: ["super_admin", "manager", "user"],
     default: "user",
   },
+  isActive: { type: Boolean, default: true },
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "User",

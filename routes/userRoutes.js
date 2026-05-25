@@ -11,7 +11,7 @@ const SupportTicket = require("../models/SupportTicket");
 const generateToken = require("../utils/generateToken");
 const { getIO } = require("../sockets/socket");
 
-const PUBLIC_USER_FIELDS = "name phone email role createdAt updatedAt";
+const PUBLIC_USER_FIELDS = "name phone email role isActive createdAt updatedAt";
 
 const emitNotification = (phone, notification) => {
   try {
@@ -80,6 +80,10 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
+    if (user.isActive === false) {
+      return res.status(403).json({ error: "Your account is inactive. Please contact admin." });
+    }
+
     // Check password
     if (!user.password) {
       return res.status(401).json({ error: "No password set. Contact admin." });
@@ -100,6 +104,7 @@ router.post("/login", async (req, res) => {
         email: user.email,
         phone: user.phone,
         role: user.role,
+        isActive: user.isActive !== false,
       },
     });
 
@@ -115,7 +120,7 @@ router.post("/login", async (req, res) => {
 // =======================
 router.get("/", protect, allowRoles("super_admin", "manager"), async (req, res) => {
   try {
-    const users = await User.find().select("name phone email role").lean();
+    const users = await User.find().select("name phone email role isActive").lean();
     res.json({ success: true, data: users });
   } catch (error) {
     res.status(500).json({ error: error.message });

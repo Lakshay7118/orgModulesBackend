@@ -8,6 +8,34 @@ const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 const router = express.Router();
 
+const attachLoginUsers = async (contacts = []) => {
+  const plainContacts = contacts.map((contact) =>
+    typeof contact.toObject === "function" ? contact.toObject() : contact
+  );
+  const phones = plainContacts.map((contact) => contact.mobile).filter(Boolean);
+  const users = await User.find({ phone: { $in: phones } })
+    .select("_id name phone email role isActive")
+    .lean();
+  const usersByPhone = new Map(users.map((user) => [String(user.phone), user]));
+
+  return plainContacts.map((contact) => {
+    const user = usersByPhone.get(String(contact.mobile));
+    return {
+      ...contact,
+      loginUser: user
+        ? {
+            _id: user._id,
+            name: user.name,
+            phone: user.phone,
+            email: user.email,
+            role: user.role,
+            isActive: user.isActive !== false,
+          }
+        : null,
+    };
+  });
+};
+
 // ── Shared helpers ───────────────────────────────────────────────
 async function notifyAdmins({ type, message, contactId }) {
   const io = getIO();
@@ -33,7 +61,7 @@ router.get("/contacts", protect, allowRoles("super_admin", "manager", "user"), a
     else filter.status = "approved";
     if (tag) filter.tags = tag;
     const contacts = await Contact.find(filter).populate("tags").populate("createdBy", "name phone role");
-    res.json(contacts);
+    res.json(req.user.role === "super_admin" ? await attachLoginUsers(contacts) : contacts);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -49,7 +77,7 @@ router.get("/contacts/managers", protect, allowRoles("super_admin"), async (req,
 router.get("/contacts/pending", protect, allowRoles("super_admin"), async (req, res) => {
   try {
     const contacts = await Contact.find({ status: "pending" }).populate("tags").populate("createdBy", "name phone role");
-    res.json(contacts);
+    res.json(await attachLoginUsers(contacts));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -96,6 +124,10 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager"), async (r
     }
 
     const populated = await contact.populate("tags");
+    if (req.user.role === "super_admin") {
+      const [enriched] = await attachLoginUsers([populated]);
+      return res.status(201).json(enriched);
+    }
     res.status(201).json(populated);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -202,7 +234,40 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
     }
 
     const populated = await contact.populate("tags");
+    if (req.user.role === "super_admin") {
+      const [enriched] = await attachLoginUsers([populated]);
+      return res.json(enriched);
+    }
     res.json(populated);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// UPDATE LOGIN ACCESS
+router.patch("/contacts/:id/login-status", protect, allowRoles("super_admin"), async (req, res) => {
+  try {
+    const contact = await Contact.findById(req.params.id)
+      .populate("tags")
+      .populate("createdBy", "name phone role");
+    if (!contact) return res.status(404).json({ error: "Contact not found" });
+
+    const lookup = [{ phone: contact.mobile }];
+    if (contact.email) lookup.push({ email: String(contact.email).toLowerCase() });
+
+    const user = await User.findOne({ $or: lookup });
+    if (!user) {
+      return res.status(404).json({ error: "This contact does not have a login account" });
+    }
+
+    const nextActive = req.body.isActive !== false;
+    if (!nextActive && String(user._id) === String(req.user.id)) {
+      return res.status(400).json({ error: "You cannot deactivate your own account" });
+    }
+
+    user.isActive = nextActive;
+    await user.save();
+
+    const [enriched] = await attachLoginUsers([contact]);
+    res.json(enriched);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
