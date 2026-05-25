@@ -151,12 +151,13 @@ const initSocket = (server) => {
     });
 
     // ================= CALL SIGNALING =================
-    socket.on("call:offer", ({ to, from, fromName, chatId, offer, callType }) => {
+    socket.on("call:offer", ({ to, from, fromName, callId, chatId, offer, callType }) => {
       if (!to || !from || !offer) return;
 
       console.log("[call:offer]", {
         from,
         to,
+        callId,
         chatId,
         recipientSockets: onlineUsers.get(to)?.size || 0,
       });
@@ -164,35 +165,46 @@ const initSocket = (server) => {
       io.to(getPhoneRooms(to)).emit("call:incoming", {
         from,
         fromName,
+        callId,
         chatId,
         offer,
         callType: callType || "audio",
       });
     });
 
-    socket.on("call:answer", ({ to, from, chatId, answer }) => {
+    socket.on("call:answer", ({ to, from, callId, chatId, answer }) => {
       if (!to || !from || !answer) return;
 
       console.log("[call:answer]", {
         from,
         to,
+        callId,
         chatId,
         recipientSockets: onlineUsers.get(to)?.size || 0,
       });
 
       io.to(getPhoneRooms(to)).emit("call:answered", {
         from,
+        callId,
         chatId,
         answer,
       });
+
+      io.to(getPhoneRooms(from)).emit("call:handled", {
+        peerPhone: to,
+        callId,
+        chatId,
+        action: "answered",
+      });
     });
 
-    socket.on("call:ice-candidate", ({ to, from, chatId, candidate }) => {
+    socket.on("call:ice-candidate", ({ to, from, callId, chatId, candidate }) => {
       if (!to || !from || !candidate) return;
 
       console.log("[call:ice-candidate]", {
         from,
         to,
+        callId,
         chatId,
         type: candidate.type,
         protocol: candidate.protocol,
@@ -201,19 +213,28 @@ const initSocket = (server) => {
 
       io.to(getPhoneRooms(to)).emit("call:ice-candidate", {
         from,
+        callId,
         chatId,
         candidate,
       });
     });
 
-    socket.on("call:reject", async ({ to, from, chatId, reason, callType }) => {
+    socket.on("call:reject", async ({ to, from, callId, chatId, reason, callType }) => {
       if (!to || !from) return;
 
       io.to(getPhoneRooms(to)).emit("call:rejected", {
         from,
+        callId,
         chatId,
         reason: reason || "rejected",
         callType: callType || "audio",
+      });
+
+      io.to(getPhoneRooms(from)).emit("call:handled", {
+        peerPhone: to,
+        callId,
+        chatId,
+        action: "rejected",
       });
 
       try {
@@ -228,11 +249,12 @@ const initSocket = (server) => {
       }
     });
 
-    socket.on("call:busy", async ({ to, from, chatId, callType }) => {
+    socket.on("call:busy", async ({ to, from, callId, chatId, callType }) => {
       if (!to || !from) return;
 
       io.to(getPhoneRooms(to)).emit("call:busy", {
         from,
+        callId,
         chatId,
         callType: callType || "audio",
       });
@@ -249,14 +271,22 @@ const initSocket = (server) => {
       }
     });
 
-    socket.on("call:end", async ({ to, from, chatId, reason, initiator, durationSeconds, wasConnected, callType }) => {
+    socket.on("call:end", async ({ to, from, callId, chatId, reason, initiator, durationSeconds, wasConnected, callType }) => {
       if (!to || !from) return;
 
       io.to(getPhoneRooms(to)).emit("call:ended", {
         from,
+        callId,
         chatId,
         reason: reason || "ended",
         callType: callType || "audio",
+      });
+
+      io.to(getPhoneRooms(from)).emit("call:handled", {
+        peerPhone: to,
+        callId,
+        chatId,
+        action: "ended",
       });
 
       try {
