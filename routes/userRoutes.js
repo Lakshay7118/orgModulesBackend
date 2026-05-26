@@ -535,6 +535,26 @@ router.patch(
   }
 );
 
+router.delete(
+  "/support-tickets/:id",
+  protect,
+  allowRoles("super_admin", "manager"),
+  async (req, res) => {
+    try {
+      const ticket = await SupportTicket.findById(req.params.id);
+      if (!ticket) return res.status(404).json({ error: "Ticket not found" });
+      if (ticket.status !== "ended") {
+        return res.status(400).json({ error: "Only ended tickets can be deleted" });
+      }
+
+      await ticket.deleteOne();
+      res.json({ success: true, message: "Ended support ticket deleted" });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+);
+
 
 // =======================
 // ✅ CREATE USER (super_admin → manager/user | manager → user only)
