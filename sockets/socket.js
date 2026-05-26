@@ -18,6 +18,29 @@ const getPhoneRooms = (phone) => {
   return Array.from(new Set([raw, digits, last10].filter(Boolean)));
 };
 
+const normalizePresenceKey = (phone) => {
+  const raw = String(phone || "").trim();
+  const digits = raw.replace(/\D/g, "");
+  if (!digits) return raw;
+  return digits.length > 10 ? digits.slice(-10) : digits;
+};
+
+const removePresenceSocket = (presenceKey, socketId) => {
+  if (!presenceKey || !socketId) return false;
+
+  const userSockets = onlineUsers.get(presenceKey);
+  if (!userSockets) return false;
+
+  userSockets.delete(socketId);
+
+  if (userSockets.size === 0) {
+    onlineUsers.delete(presenceKey);
+    lastSeenMap[presenceKey] = new Date().toISOString();
+  }
+
+  return true;
+};
+
 const normalizeCallStatus = ({ reason, wasConnected, durationSeconds }) => {
   if (wasConnected || durationSeconds > 0) return "ended";
   if (reason === "busy") return "busy";
@@ -84,23 +107,32 @@ const initSocket = (server) => {
     // ================= USER ONLINE =================
     socket.on("joinUserRoom", (userPhone) => {
       if (!userPhone) return;
+      const presenceKey = normalizePresenceKey(userPhone);
+      if (!presenceKey) return;
 
       // ❌ prevent duplicate join from same socket
-      if (socket.userPhone === userPhone) return;
+      if (socket.userPhone === presenceKey) {
+        emitPresence(socket);
+        return;
+      }
 
-      socket.userPhone = userPhone;
+      if (socket.userPhone && socket.userPhone !== presenceKey) {
+        removePresenceSocket(socket.userPhone, socket.id);
+      }
+
+      socket.userPhone = presenceKey;
       getPhoneRooms(userPhone).forEach(room => socket.join(room));
 
-      let userSockets = onlineUsers.get(userPhone);
+      let userSockets = onlineUsers.get(presenceKey);
 
       if (!userSockets) {
         userSockets = new Set();
-        onlineUsers.set(userPhone, userSockets);
+        onlineUsers.set(presenceKey, userSockets);
       }
 
       userSockets.add(socket.id);
 
-      delete lastSeenMap[userPhone];
+      delete lastSeenMap[presenceKey];
 
       emitPresence();
     });
@@ -108,16 +140,14 @@ const initSocket = (server) => {
     // ================= USER LEAVE =================
     socket.on("leaveUserRoom", (userPhone) => {
       if (!userPhone) return;
-
-      const userSockets = onlineUsers.get(userPhone);
-      if (!userSockets) return;
+      const presenceKey = normalizePresenceKey(userPhone);
+      if (!presenceKey) return;
 
       getPhoneRooms(userPhone).forEach(room => socket.leave(room));
-      userSockets.delete(socket.id);
+      const removed = removePresenceSocket(presenceKey, socket.id);
 
-      if (userSockets.size === 0) {
-        onlineUsers.delete(userPhone);
-        lastSeenMap[userPhone] = new Date().toISOString();
+      if (removed && socket.userPhone === presenceKey) {
+        socket.userPhone = null;
       }
 
       emitPresence();
@@ -128,16 +158,7 @@ const initSocket = (server) => {
       const userPhone = socket.userPhone;
       if (!userPhone) return;
 
-      const userSockets = onlineUsers.get(userPhone);
-      if (!userSockets) return;
-
-      userSockets.delete(socket.id);
-
-      if (userSockets.size === 0) {
-        onlineUsers.delete(userPhone);
-        lastSeenMap[userPhone] = new Date().toISOString();
-      }
-
+      removePresenceSocket(userPhone, socket.id);
       emitPresence();
     });
 
@@ -324,11 +345,11 @@ const initSocket = (server) => {
   });
 
   // ================= EMIT PRESENCE =================
-const emitPresence = () => {
+const emitPresence = (target = io) => {
   // ✅ clean stale lastSeen for any user who is currently online
   onlineUsers.forEach((_, phone) => { delete lastSeenMap[phone]; });
   
-  io.emit("onlineUsers", {
+  target.emit("onlineUsers", {
     users: Array.from(onlineUsers.keys()),
     lastSeen: lastSeenMap,
   });
