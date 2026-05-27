@@ -17,6 +17,87 @@ const { getIO } = require("../sockets/socket");
 
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware"); // 🔥 ADD
+function normalizeTemplateText(value = "") {
+  return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function getTemplateBody(message = {}) {
+  return (
+    message.templateMeta?.resolvedText ||
+    message.templateMeta?.body ||
+    message.text ||
+    ""
+  );
+}
+
+function getCampaignTemplateDedupeKey(message = {}) {
+  if (message.messageType !== "template" || !message.campaignRunKey || !message.recipientPhone) {
+    return null;
+  }
+
+  const templateId = message.templateMeta?.templateId
+    ? String(message.templateMeta.templateId)
+    : "";
+  const body = normalizeTemplateText(getTemplateBody(message));
+
+  return [
+    "campaign-template",
+    String(message.chatId || ""),
+    String(message.sender || ""),
+    String(message.campaignRunKey || ""),
+    String(message.recipientPhone || ""),
+    templateId,
+    body,
+  ].join(":");
+}
+
+function getTemplateRichness(message = {}) {
+  const template = message.templateMeta || {};
+  const actions = template.actions || {};
+  let score = 0;
+
+  if (template.mediaUrl) score += 100;
+  if (template.mediaType && template.mediaType !== "None") score += 20;
+  if (template.header) score += 5;
+  if (template.footer) score += 5;
+  if (getTemplateBody(message)) score += 5;
+  if (Array.isArray(template.carouselItems) && template.carouselItems.length) score += 20;
+  ["ctaButtons", "quickReplies", "copyCodeButtons", "dropdownButtons", "inputFields"].forEach((key) => {
+    if (Array.isArray(actions[key])) score += actions[key].length;
+  });
+
+  return score;
+}
+
+function dedupeCampaignTemplateMessages(messages = []) {
+  const result = [];
+  const seen = new Map();
+
+  messages.forEach((message) => {
+    const key = getCampaignTemplateDedupeKey(message);
+
+    if (!key) {
+      result.push(message);
+      return;
+    }
+
+    if (!seen.has(key)) {
+      seen.set(key, result.length);
+      result.push(message);
+      return;
+    }
+
+    const existingIndex = seen.get(key);
+    const existing = result[existingIndex];
+
+    if (getTemplateRichness(message) > getTemplateRichness(existing)) {
+      result[existingIndex] = message;
+    }
+  });
+
+  return result;
+}
+
 // =======================
 // ✅ GET MESSAGES (SECURE)
 // =======================
@@ -39,9 +120,9 @@ router.get("/", protect, async (req, res) => {
     const msgs = await Message.find({
       chatId,
       deletedBy: { $ne: userPhone },
-    }).sort({ createdAt: 1 });
+    }).sort({ createdAt: 1 }).lean();
 
-    res.json(msgs);
+    res.json(dedupeCampaignTemplateMessages(msgs));
 
   } catch (err) {
     res.status(500).json({ error: err.message });
