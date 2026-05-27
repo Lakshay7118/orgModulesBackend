@@ -141,6 +141,8 @@ router.post("/campaigns", protect, allowRoles("super_admin", "manager"), async (
       groupIds, manualNumbers, templateId, scheduledDateTime,
       recurrence, variableValues: requestVariableValues, messagePreview, launchKey,
     } = req.body;
+    const launchKeyValue =
+      typeof launchKey === "string" && launchKey.trim() ? launchKey.trim() : null;
 
     if (!campaignName) return res.status(400).json({ error: "campaignName is required" });
     if (!["tags", "contact", "group", "manual"].includes(audienceType))
@@ -170,11 +172,11 @@ router.post("/campaigns", protect, allowRoles("super_admin", "manager"), async (
 
     const approvalStatus = req.user.role === "super_admin" ? "approved" : "pending_approval";
 
-    if (launchKey) {
+    if (launchKeyValue) {
       const existingCampaign = await Campaign.findOne({
         createdBy: req.user.id,
-        launchKey,
-      });
+        launchKey: launchKeyValue,
+      }).sort({ createdAt: 1 });
 
       if (existingCampaign) {
         return res.status(200).json({
@@ -188,7 +190,7 @@ router.post("/campaigns", protect, allowRoles("super_admin", "manager"), async (
     }
 
     const campaign = new Campaign({
-      launchKey: launchKey || null,
+      launchKey: launchKeyValue,
       campaignName, messageType, audienceType,
       tagIds: tagIds || [], contactIds: contactIds || [],
       groupIds: groupIds || [], manualNumbers: manualNumbers || [],

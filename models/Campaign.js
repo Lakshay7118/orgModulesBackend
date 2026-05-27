@@ -88,4 +88,10 @@ const CampaignSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+CampaignSchema.index(
+  { createdBy: 1, launchKey: 1 },
+  { partialFilterExpression: { launchKey: { $type: "string" } } }
+);
+CampaignSchema.index({ status: 1, approvalStatus: 1, nextRun: 1 });
+
 module.exports = mongoose.model("Campaign", CampaignSchema);

@@ -17,6 +17,27 @@ function getCampaignRunKey(campaign) {
   return new Date(runDate).toISOString();
 }
 
+function getCampaignIdentity(campaign) {
+  const launchKey = String(campaign.launchKey || "").trim();
+  if (!launchKey) return String(campaign._id);
+
+  const createdById = campaign.createdBy?._id || campaign.createdBy || "";
+  return `launch:${createdById}:${launchKey}`;
+}
+
+function getLegacyCampaignDeliveryKey(campaign, campaignRunKey, recipientPhone) {
+  return `${campaign._id}:${campaignRunKey}:${recipientPhone}`;
+}
+
+function getCampaignDeliveryKeys(campaign, campaignRunKey, recipientPhone) {
+  const keys = [
+    `${getCampaignIdentity(campaign)}:${campaignRunKey}:${recipientPhone}`,
+    getLegacyCampaignDeliveryKey(campaign, campaignRunKey, recipientPhone),
+  ];
+
+  return [...new Set(keys)];
+}
+
 function dedupeRecipientsByPhone(recipients) {
   const seen = new Set();
   return recipients.filter((recipient) => {
@@ -41,7 +62,40 @@ function getTemplateLastMessage(msg, sender) {
 
 // 🔥 SAFE TEMPLATE RESOLVER
 function getCampaignDeliveryKey(campaign, campaignRunKey, recipientPhone) {
-  return `${campaign._id}:${campaignRunKey}:${recipientPhone}`;
+  return getCampaignDeliveryKeys(campaign, campaignRunKey, recipientPhone)[0];
+}
+
+const launchCampaignIdsCache = new Map();
+
+async function getLaunchSiblingCampaignIds(campaign) {
+  const launchKey = String(campaign.launchKey || "").trim();
+  if (!launchKey) return [campaign._id];
+
+  const createdById = campaign.createdBy?._id || campaign.createdBy;
+  if (!createdById) return [campaign._id];
+
+  const cacheKey = `${createdById}:${launchKey}`;
+  if (!launchCampaignIdsCache.has(cacheKey)) {
+    const ids = await Campaign.find({ createdBy: createdById, launchKey }).distinct("_id");
+    launchCampaignIdsCache.set(cacheKey, ids);
+  }
+
+  return launchCampaignIdsCache.get(cacheKey);
+}
+
+async function findExistingCampaignMessage(campaign, campaignRunKey, recipientPhone, deliveryKeys) {
+  const filters = [{ campaignDeliveryKey: { $in: deliveryKeys } }];
+
+  if (campaign.launchKey) {
+    const siblingCampaignIds = await getLaunchSiblingCampaignIds(campaign);
+    filters.push({
+      campaignId: { $in: siblingCampaignIds },
+      campaignRunKey,
+      recipientPhone,
+    });
+  }
+
+  return Message.findOne({ $or: filters });
 }
 
 async function reserveCampaignDelivery(lockData) {
@@ -73,6 +127,10 @@ async function markCampaignDeliverySent(campaignDeliveryKey, messageId) {
 
 async function releaseCampaignDelivery(campaignDeliveryKey) {
   await CampaignDelivery.findByIdAndDelete(campaignDeliveryKey);
+}
+
+function isDuplicateKeyError(err) {
+  return err?.code === 11000;
 }
 
 function resolveTemplateText(templateText, variableValues, contact) {
@@ -115,6 +173,7 @@ async function sendMessageToContact(contact, campaign, io) {
   const campaignRunKey = getCampaignRunKey(campaign);
   const recipientPhone = normalizePhone(targetPhone);
   const campaignDeliveryKey = getCampaignDeliveryKey(campaign, campaignRunKey, recipientPhone);
+  const deliveryKeysToCheck = getCampaignDeliveryKeys(campaign, campaignRunKey, recipientPhone);
 
   if (!creatorPhone || !targetPhone) {
     console.error("❌ Missing phone:", { creatorPhone, targetPhone });
@@ -133,9 +192,12 @@ async function sendMessageToContact(contact, campaign, io) {
     console.log("✅ New chat created:", chat._id);
   }
 
-  const existingMessage = await Message.findOne({
-    campaignDeliveryKey,
-  });
+  const existingMessage = await findExistingCampaignMessage(
+    campaign,
+    campaignRunKey,
+    recipientPhone,
+    deliveryKeysToCheck
+  );
 
   if (existingMessage) {
     console.log("Skipping duplicate campaign delivery:", campaign._id, recipientPhone);
@@ -209,12 +271,28 @@ async function sendMessageToContact(contact, campaign, io) {
     });
     await markCampaignDeliverySent(campaignDeliveryKey, msg._id);
   } catch (err) {
+    if (isDuplicateKeyError(err)) {
+      const existing = await findExistingCampaignMessage(
+        campaign,
+        campaignRunKey,
+        recipientPhone,
+        deliveryKeysToCheck
+      );
+      if (existing) {
+        await markCampaignDeliverySent(campaignDeliveryKey, existing._id);
+        console.log("Skipping duplicate campaign delivery:", campaign._id, recipientPhone);
+        return { msg: existing, created: false };
+      }
+    }
+
     await releaseCampaignDelivery(campaignDeliveryKey);
     throw err;
   }
 
+  const lastMessage = getTemplateLastMessage(msg, creatorPhone);
+
   await Chat.findByIdAndUpdate(chat._id, {
-    lastMessage: "📋 Template",
+    lastMessage,
     updatedAt: new Date(),
   });
 
@@ -224,13 +302,13 @@ async function sendMessageToContact(contact, campaign, io) {
   io.to(creatorPhone).emit("chatUpdated", {
     chatId: chat._id,
     isNewChat,
-    lastMessage: "📋 Template",
+    lastMessage,
     participants: [creatorPhone, targetPhone],
   });
   io.to(targetPhone).emit("chatUpdated", {
     chatId: chat._id,
     isNewChat,
-    lastMessage: "📋 Template",
+    lastMessage,
     participants: [creatorPhone, targetPhone],
   });
 
@@ -244,9 +322,13 @@ async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creato
   const campaignRunKey = getCampaignRunKey(campaign);
   const recipientPhone = `group:${groupChat._id}`;
   const campaignDeliveryKey = getCampaignDeliveryKey(campaign, campaignRunKey, recipientPhone);
-  const existingMessage = await Message.findOne({
-    campaignDeliveryKey,
-  });
+  const deliveryKeysToCheck = getCampaignDeliveryKeys(campaign, campaignRunKey, recipientPhone);
+  const existingMessage = await findExistingCampaignMessage(
+    campaign,
+    campaignRunKey,
+    recipientPhone,
+    deliveryKeysToCheck
+  );
 
   if (existingMessage) {
     console.log("Skipping duplicate group campaign delivery:", campaign._id, groupChat._id);
@@ -268,6 +350,7 @@ async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creato
 
   const template = await Template.findById(campaign.templateId).lean();
   if (!template) {
+    await releaseCampaignDelivery(campaignDeliveryKey);
     console.error("❌ Template not found:", campaign.templateId);
     return;
   }
@@ -333,13 +416,29 @@ async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creato
     });
     await markCampaignDeliverySent(campaignDeliveryKey, msg._id);
   } catch (err) {
+    if (isDuplicateKeyError(err)) {
+      const existing = await findExistingCampaignMessage(
+        campaign,
+        campaignRunKey,
+        recipientPhone,
+        deliveryKeysToCheck
+      );
+      if (existing) {
+        await markCampaignDeliverySent(campaignDeliveryKey, existing._id);
+        console.log("Skipping duplicate group campaign delivery:", campaign._id, groupChat._id);
+        return { msg: existing, created: false };
+      }
+    }
+
     await releaseCampaignDelivery(campaignDeliveryKey);
     throw err;
   }
 
   // ✅ Update group chat lastMessage
+  const lastMessage = getTemplateLastMessage(msg, creatorPhone);
+
   await Chat.findByIdAndUpdate(groupChat._id, {
-    lastMessage: "📋 Template",
+    lastMessage,
     updatedAt: new Date(),
   });
 
@@ -353,7 +452,7 @@ async function sendMessageToGroupChat(groupChat, campaign, io, groupName, creato
     io.to(phone).emit("chatUpdated", {
       chatId: groupChat._id,
       isNewChat: false,
-      lastMessage: "📋 Template",
+      lastMessage,
       participants: groupChat.participants,
     });
   });
