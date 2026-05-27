@@ -30,25 +30,56 @@ function getTemplateBody(message = {}) {
   );
 }
 
-function getCampaignTemplateDedupeKey(message = {}) {
-  if (message.messageType !== "template" || !message.campaignRunKey || !message.recipientPhone) {
-    return null;
-  }
+function getTemplateActionSignature(message = {}) {
+  const actions = message.templateMeta?.actions || {};
+  return ["ctaButtons", "quickReplies", "copyCodeButtons", "dropdownButtons", "inputFields"]
+    .map((key) => `${key}:${JSON.stringify(actions[key] || [])}`)
+    .join("|");
+}
+
+function getTemplateTimeBucket(message = {}, bucketMs = 2 * 60 * 1000) {
+  const time = new Date(message.createdAt || message.deliveredAt || 0).getTime();
+  if (!Number.isFinite(time) || time <= 0) return "";
+  return String(Math.floor(time / bucketMs));
+}
+
+function getTemplateDedupeKeys(message = {}) {
+  if (message.messageType !== "template") return [];
 
   const templateId = message.templateMeta?.templateId
     ? String(message.templateMeta.templateId)
     : "";
   const body = normalizeTemplateText(getTemplateBody(message));
+  const footer = normalizeTemplateText(message.templateMeta?.footer || "");
+  const keys = [];
 
-  return [
-    "campaign-template",
-    String(message.chatId || ""),
-    String(message.sender || ""),
-    String(message.campaignRunKey || ""),
-    String(message.recipientPhone || ""),
-    templateId,
-    body,
-  ].join(":");
+  if (message.campaignRunKey || message.recipientPhone || message.campaignDeliveryKey) {
+    keys.push([
+      "campaign-template",
+      String(message.chatId || ""),
+      String(message.sender || ""),
+      String(message.campaignRunKey || ""),
+      String(message.recipientPhone || ""),
+      templateId,
+      body,
+    ].join(":"));
+  }
+
+  const bucket = getTemplateTimeBucket(message);
+  if (body && bucket) {
+    keys.push([
+      "visual-template",
+      String(message.chatId || ""),
+      String(message.sender || ""),
+      templateId,
+      body,
+      footer,
+      getTemplateActionSignature(message),
+      bucket,
+    ].join(":"));
+  }
+
+  return keys;
 }
 
 function getTemplateRichness(message = {}) {
@@ -74,24 +105,26 @@ function dedupeCampaignTemplateMessages(messages = []) {
   const seen = new Map();
 
   messages.forEach((message) => {
-    const key = getCampaignTemplateDedupeKey(message);
+    const keys = getTemplateDedupeKeys(message);
+    const duplicateKey = keys.find((key) => seen.has(key));
 
-    if (!key) {
+    if (!keys.length) {
       result.push(message);
       return;
     }
 
-    if (!seen.has(key)) {
-      seen.set(key, result.length);
+    if (!duplicateKey) {
+      keys.forEach((key) => seen.set(key, result.length));
       result.push(message);
       return;
     }
 
-    const existingIndex = seen.get(key);
+    const existingIndex = seen.get(duplicateKey);
     const existing = result[existingIndex];
 
     if (getTemplateRichness(message) > getTemplateRichness(existing)) {
       result[existingIndex] = message;
+      keys.forEach((key) => seen.set(key, existingIndex));
     }
   });
 
