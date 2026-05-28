@@ -1,10 +1,46 @@
 const express = require("express");
 const Tag = require("../models/Tag");
+const User = require("../models/Users");
+const mongoose = require("mongoose");
 
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware"); // 🔥 ADD
 
 const router = express.Router();
+
+const enrichTagsWithCreators = async (tags = []) => {
+  const plainTags = tags.map((tag) =>
+    typeof tag.toObject === "function" ? tag.toObject() : tag
+  );
+  const creatorIds = [
+    ...new Set(
+      plainTags
+        .map((tag) => String(tag.createdBy || ""))
+        .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    ),
+  ];
+
+  const users = await User.find({ _id: { $in: creatorIds } })
+    .select("_id name phone email role")
+    .lean();
+  const usersById = new Map(users.map((user) => [String(user._id), user]));
+
+  return plainTags.map((tag) => {
+    const creator = usersById.get(String(tag.createdBy));
+    return {
+      ...tag,
+      createdByUser: creator
+        ? {
+            _id: creator._id,
+            name: creator.name,
+            phone: creator.phone,
+            email: creator.email,
+            role: creator.role,
+          }
+        : null,
+    };
+  });
+};
 
 
 // =======================
@@ -26,7 +62,7 @@ router.get(
       const tags = await Tag.find(filter)
         .sort({ createdAt: -1 });
 
-      res.json({ success: true, tags });
+      res.json({ success: true, tags: await enrichTagsWithCreators(tags) });
 
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -64,7 +100,8 @@ router.post(
 
       await tag.save();
 
-      res.status(201).json({ success: true, tag });
+      const [enrichedTag] = await enrichTagsWithCreators([tag]);
+      res.status(201).json({ success: true, tag: enrichedTag });
 
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -103,7 +140,8 @@ router.put(
 
       await tag.save();
 
-      res.json({ success: true, tag });
+      const [enrichedTag] = await enrichTagsWithCreators([tag]);
+      res.json({ success: true, tag: enrichedTag });
 
     } catch (err) {
       res.status(500).json({ error: err.message });
