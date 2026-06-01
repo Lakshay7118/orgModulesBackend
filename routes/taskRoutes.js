@@ -498,18 +498,19 @@ router.post("/:id/response", protect, async (req, res) => {
       return res.status(403).json({ error: "Task is pending approval — responses locked" });
     }
 
-    const { message, formData } = req.body;
+    const { message, formData, attachments } = req.body;
 
     const safeFormData = {
-      inputFields: formData?.inputFields || [],
-      dropdownSelections: formData?.dropdownSelections || [],
+      inputFields: Array.isArray(formData?.inputFields) ? formData.inputFields : [],
+      dropdownSelections: Array.isArray(formData?.dropdownSelections) ? formData.dropdownSelections : [],
       quickReplySelected: formData?.quickReplySelected || "",
-      checkboxSelections: formData?.checkboxSelections || [],
+      checkboxSelections: Array.isArray(formData?.checkboxSelections) ? formData.checkboxSelections : [],
     };
 
     const response = {
       userId: req.user.id,
       message: message || "",
+      attachments: Array.isArray(attachments) ? attachments : [],
       formData: safeFormData,
       createdAt: new Date(),
     };
@@ -522,6 +523,7 @@ router.post("/:id/response", protect, async (req, res) => {
       .populate("assignedTo", "name phone role")
       .populate("responses.userId", "name phone role");
 
+    try {
        const sender = populatedTask.responses[populatedTask.responses.length - 1].userId;
     const senderName = sender?.name || "Someone";
 
@@ -542,6 +544,9 @@ router.post("/:id/response", protect, async (req, res) => {
         io.to(uid.toString()).emit("taskUpdated", populatedTask);
       }
     });
+    } catch (notifyError) {
+      console.error("Task response notification error:", notifyError.message);
+    }
 
     res.json({ success: true, data: populatedTask });
   } catch (error) {
@@ -554,6 +559,41 @@ router.post("/:id/response", protect, async (req, res) => {
 // — Admin: real update, broadcasted to all
 // — Non-admin: 200 OK but status is NOT saved (frontend handles locally)
 // =======================
+// =======================
+// DELETE OWN RESPONSE
+// =======================
+router.delete("/:id/response/:responseId", protect, async (req, res) => {
+  try {
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ error: "Task not found" });
+
+    const response = task.responses.id(req.params.responseId);
+    if (!response) return res.status(404).json({ error: "Response not found" });
+
+    if (response.userId.toString() !== req.user.id) {
+      return res.status(403).json({ error: "You can only delete your own message" });
+    }
+
+    response.deleteOne();
+    await task.save();
+
+    const populatedTask = await Task.findById(task._id)
+      .populate("createdBy", "name phone role")
+      .populate("assignedTo", "name phone role")
+      .populate("responses.userId", "name phone role");
+
+    const io = getIO();
+    const recipients = [task.createdBy.toString(), ...task.assignedTo.map((id) => id.toString())];
+    [...new Set(recipients)].forEach((uid) => {
+      io.to(uid).emit("taskUpdated", populatedTask);
+    });
+
+    res.json({ success: true, data: populatedTask });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.patch("/:id/status", protect, async (req, res) => {
   try {
     const task = await Task.findById(req.params.id);

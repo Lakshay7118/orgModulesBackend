@@ -1,6 +1,7 @@
 const express = require("express");
 const multer = require("multer");
 const router = express.Router();
+const path = require("path");
 
 const cloudinary = require("../config/cloudinary");
 const protect = require("../middleware/authMiddleware");
@@ -39,6 +40,35 @@ const allowedTypes = [
   "text/xml",
 ];
 
+router.post("/download", protect, async (req, res) => {
+  try {
+    const { url, fileName } = req.body || {};
+    if (!url) return res.status(400).json({ error: "File URL is required" });
+
+    const parsed = new URL(url);
+    if (!parsed.hostname.endsWith("cloudinary.com")) {
+      return res.status(400).json({ error: "Unsupported file host" });
+    }
+
+    const upstream = await fetch(parsed.toString());
+    if (!upstream.ok) {
+      return res.status(502).json({ error: "Could not fetch file" });
+    }
+
+    const safeName = path.basename(fileName || "attachment").replace(/[\r\n"]/g, "_");
+    const contentType = upstream.headers.get("content-type") || "application/octet-stream";
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Length", buffer.length);
+    res.setHeader("Content-Disposition", `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`);
+    return res.send(buffer);
+  } catch (err) {
+    console.error("Download Error:", err);
+    return res.status(500).json({ error: "Download failed" });
+  }
+});
+
 // =======================
 // 🔥 UPLOAD FILE
 // =======================
@@ -76,6 +106,14 @@ const resource_type = isVideo || isAudio ? "video" : isImage ? "image" : "raw"; 
 const messageType = isImage ? "image" : isVideo ? "video" : isAudio ? "audio" : "file";  // ✅ CHANGE
 
     // ================= SIZE VALIDATION =================
+    const safeStem = path
+      .basename(file.originalname, path.extname(file.originalname))
+      .replace(/[^a-z0-9_-]+/gi, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 60) || "file";
+    const originalExt = path.extname(file.originalname).toLowerCase();
+    const publicId = `${userRole}_${userPhone}_${Date.now()}_${safeStem}${resource_type === "raw" ? originalExt : ""}`;
+
     if (file.size > 50 * 1024 * 1024) {
       return res.status(400).json({ error: "File too large. Max 50MB allowed." });
     }
@@ -85,7 +123,7 @@ const messageType = isImage ? "image" : isVideo ? "video" : isAudio ? "audio" : 
       {
         resource_type, // ✅ "raw" for PDFs/docs, "image" for images, "video" for videos
         folder: "chat_uploads",
-        public_id: `${userRole}_${userPhone}_${Date.now()}`,
+        public_id: publicId,
         use_filename: true,
       },
       (error, result) => {

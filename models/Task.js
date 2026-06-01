@@ -38,8 +38,12 @@ const TaskSchema = new mongoose.Schema(
     attachments: [
       {
         url: String,
+        fileUrl: String,
         filename: String,
+        fileName: String,
+        fileSize: Number,
         mimetype: String,
+        messageType: String,
         _id: false,
       },
     ],
@@ -108,6 +112,18 @@ responses: [
   {
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     message: { type: String, default: "" },
+    attachments: [
+      {
+        url: String,
+        fileUrl: String,
+        filename: String,
+        fileName: String,
+        fileSize: Number,
+        mimetype: String,
+        messageType: String,
+        _id: false,
+      },
+    ],
     formData: {
       inputFields: [
         { id: String, value: String, _id: false },

@@ -104,6 +104,10 @@ const initSocket = (server) => {
       socket.join(chatId);
     });
 
+    socket.on("joinUserIdRoom", (userId) => {
+      if (userId) socket.join(userId.toString());
+    });
+
     // ================= USER ONLINE =================
     socket.on("joinUserRoom", (userPhone) => {
       if (!userPhone) return;
