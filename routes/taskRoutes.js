@@ -9,7 +9,7 @@ const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 
 const TASK_UPDATE_FIELDS = [
-  "title", "description", "dueDate", "reminderAt", "priority",
+  "title", "description", "dueDate", "reminderAt", "reminders", "priority",
   "attachments", "inputFields", "dropdownButtons", "quickReplies",
   "ctaButtons", "checkboxes", "assignedTo", "isPersonal",
 ];
@@ -19,7 +19,32 @@ const pickTaskUpdates = (body) => {
   TASK_UPDATE_FIELDS.forEach((field) => {
     if (body[field] !== undefined) updates[field] = body[field];
   });
+  if (updates.reminders !== undefined || updates.reminderAt !== undefined) {
+    const reminderData = normalizeReminders(updates.reminders, updates.reminderAt);
+    updates.reminders = reminderData.reminders;
+    updates.reminderAt = reminderData.reminderAt;
+  }
   return updates;
+};
+
+const normalizeReminders = (reminders, reminderAt) => {
+  const raw = Array.isArray(reminders) ? reminders : (reminderAt ? [reminderAt] : []);
+  const seen = new Set();
+  const normalized = raw
+    .map((item) => {
+      const value = item?.remindAt || item;
+      const date = value ? new Date(value) : null;
+      if (!date || Number.isNaN(date.getTime())) return null;
+      const key = date.toISOString();
+      if (seen.has(key)) return null;
+      seen.add(key);
+      return { remindAt: date, sentAt: item?.sentAt || null };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.remindAt - b.remindAt);
+  const now = new Date();
+  const next = normalized.find((reminder) => !reminder.sentAt && reminder.remindAt > now);
+  return { reminders: normalized, reminderAt: next?.remindAt || normalized[0]?.remindAt || null };
 };
 
 const broadcastTaskAssignmentChanges = async (task, previousAssigneeIds, io) => {
@@ -113,6 +138,7 @@ router.post("/", protect, allowRoles("super_admin", "manager", "user"), async (r
       assignedTo,
       dueDate,
       reminderAt,
+      reminders,
       priority,
       attachments,
       isPersonal,
@@ -161,6 +187,8 @@ router.post("/", protect, allowRoles("super_admin", "manager", "user"), async (r
       resolvedApprovalStatus = "pending";
     }
 
+    const reminderData = normalizeReminders(reminders, reminderAt);
+
     const task = new Task({
       title,
       description,
@@ -168,7 +196,8 @@ router.post("/", protect, allowRoles("super_admin", "manager", "user"), async (r
       assignedTo: assignedUserIds,
       isPersonal: isPersonal || false,
       dueDate,
-      reminderAt: reminderAt || null,
+      reminderAt: reminderData.reminderAt,
+      reminders: reminderData.reminders,
       priority: priority || "medium",
       attachments: attachments || [],
       inputFields: inputFields || [],

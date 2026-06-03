@@ -6,32 +6,61 @@ const { getIO } = require("../sockets/socket");
 async function sendReminders() {
   const now = new Date();
   const tasks = await Task.find({
-    reminderAt: { $lte: now },
-    status: { $ne: "completed" },
-  }).populate("assignedTo", "_id");
+    $or: [
+      { reminderAt: { $lte: now } },
+      { reminders: { $elemMatch: { remindAt: { $lte: now }, sentAt: null } } },
+    ],
+    status: { $nin: ["completed", "cancelled"] },
+  })
+    .populate("createdBy", "_id")
+    .populate("assignedTo", "_id");
 
   if (tasks.length === 0) return;
 
   const io = getIO();
 
   for (const task of tasks) {
-    for (const user of task.assignedTo) {
-      const notif = await Notification.create({
-        userId: user._id,
-        type: "task_reminder",
-        message: `Reminder: Task "${task.title}" is due soon.`,
-        taskId: task._id,
-      });
-      io.to(user._id.toString()).emit("newNotification", notif);
-      io.to(user._id.toString()).emit("taskReminder", {
-        taskId: task._id,
-        title: task.title,
-        dueDate: task.dueDate,
+    const dueReminders = Array.isArray(task.reminders)
+      ? task.reminders.filter((reminder) => reminder.remindAt && !reminder.sentAt && reminder.remindAt <= now)
+      : [];
+    const shouldSendLegacyReminder = task.reminderAt && task.reminderAt <= now && dueReminders.length === 0;
+
+    if (dueReminders.length > 0 || shouldSendLegacyReminder) {
+      const recipientIds = [
+        task.createdBy?._id,
+        ...(task.assignedTo || []).map((user) => user?._id),
+      ].filter(Boolean);
+
+      for (const userId of [...new Set(recipientIds.map((id) => id.toString()))]) {
+        const notif = await Notification.create({
+          userId,
+          type: "task_reminder",
+          message: `Reminder: Task "${task.title}" is due soon.`,
+          taskId: task._id,
+        });
+        io.to(userId).emit("newNotification", notif);
+        io.to(userId).emit("taskReminder", {
+          taskId: task._id,
+          title: task.title,
+          dueDate: task.dueDate,
+        });
+      }
+    }
+
+    if (dueReminders.length > 0) {
+      task.reminders = task.reminders.map((reminder) => {
+        if (reminder.remindAt && !reminder.sentAt && reminder.remindAt <= now) {
+          reminder.sentAt = now;
+        }
+        return reminder;
       });
     }
 
-    // Clear reminder to prevent repeats
-    task.reminderAt = null;
+    const nextReminder = (task.reminders || [])
+      .filter((reminder) => reminder.remindAt && !reminder.sentAt && reminder.remindAt > now)
+      .sort((a, b) => a.remindAt - b.remindAt)[0];
+
+    task.reminderAt = nextReminder?.remindAt || null;
     await task.save();
   }
 }

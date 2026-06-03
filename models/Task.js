@@ -22,6 +22,13 @@ const TaskSchema = new mongoose.Schema(
 
     dueDate: { type: Date, required: true },
     reminderAt: { type: Date },
+    reminders: [
+      {
+        remindAt: { type: Date, required: true },
+        sentAt: { type: Date, default: null },
+        _id: false,
+      },
+    ],
 
     priority: {
       type: String,
