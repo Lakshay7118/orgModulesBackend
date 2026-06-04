@@ -1,4 +1,5 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
 
 const HRDepartment = require("../models/HRDepartment");
@@ -85,6 +86,25 @@ const dateOnly = (date) => {
   if (!date) return "";
   const parsed = date instanceof Date ? date : new Date(date);
   return Number.isNaN(parsed.getTime()) ? "" : formatUTCDate(parsed);
+};
+const isObjectId = (value) => !value || mongoose.Types.ObjectId.isValid(value);
+const sendHrError = (res, error, fallback = "HR request failed") => {
+  if (error?.code === 11000) {
+    const field = Object.keys(error.keyPattern || error.keyValue || {})[0] || "field";
+    const label = field === "employeeCode" ? "Employee code" : field;
+    return res.status(409).json({ error: `${label} already exists.` });
+  }
+
+  if (error?.name === "ValidationError") {
+    const message = Object.values(error.errors || {})[0]?.message || error.message || fallback;
+    return res.status(400).json({ error: message });
+  }
+
+  if (error?.name === "CastError") {
+    return res.status(400).json({ error: `Invalid ${error.path || "value"}.` });
+  }
+
+  return res.status(500).json({ error: error?.message || fallback });
 };
 const buildPeriodFromDueDate = (dueDate, cycleStartDay = 1) => {
   const safeCycleDay = normalizeCycleDay(cycleStartDay);
@@ -637,12 +657,18 @@ router.get("/staff", async (req, res) => {
 
 router.post("/staff", async (req, res) => {
   try {
+    const name = String(req.body.name || "").trim();
+    const department = req.body.department || null;
+
+    if (!name) return res.status(400).json({ error: "Staff name is required." });
+    if (!isObjectId(department)) return res.status(400).json({ error: "Invalid department." });
+
     const staff = await HRStaff.create({
-      employeeCode: req.body.employeeCode || undefined,
-      name: req.body.name,
+      employeeCode: String(req.body.employeeCode || "").trim() || undefined,
+      name,
       email: req.body.email || "",
       phone: req.body.phone || "",
-      department: req.body.department || null,
+      department,
       designation: req.body.designation || "",
       monthlySalary: money(req.body.monthlySalary),
       salaryBasis: normalizeSalaryBasis(req.body.salaryBasis),
@@ -658,7 +684,7 @@ router.post("/staff", async (req, res) => {
     await staff.populate("department");
     res.status(201).json({ success: true, data: staff });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendHrError(res, error, "Could not save staff.");
   }
 });
 
@@ -679,6 +705,11 @@ router.patch("/staff/:id", async (req, res) => {
     ].forEach((field) => {
       if (req.body[field] !== undefined) updates[field] = req.body[field] || (field === "department" ? null : req.body[field]);
     });
+    if (updates.name !== undefined) updates.name = String(updates.name || "").trim();
+    if (updates.employeeCode !== undefined) updates.employeeCode = String(updates.employeeCode || "").trim() || undefined;
+    if (updates.department !== undefined && !isObjectId(updates.department)) {
+      return res.status(400).json({ error: "Invalid department." });
+    }
     if (req.body.salaryBasis !== undefined) updates.salaryBasis = normalizeSalaryBasis(req.body.salaryBasis);
     if (req.body.payrollCycleDay !== undefined) updates.payrollCycleDay = normalizeCycleDay(req.body.payrollCycleDay);
     if (req.body.monthlySalary !== undefined) updates.monthlySalary = money(req.body.monthlySalary);
@@ -691,7 +722,7 @@ router.patch("/staff/:id", async (req, res) => {
     if (!staff) return res.status(404).json({ error: "Staff not found" });
     res.json({ success: true, data: staff });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendHrError(res, error, "Could not save staff.");
   }
 });
 
