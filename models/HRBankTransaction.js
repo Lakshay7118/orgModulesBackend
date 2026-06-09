@@ -9,7 +9,7 @@ const HRBankTransactionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["salary", "manual_out", "manual_in", "loan_out", "loan_repayment", "advance_out"],
+      enum: ["salary", "salary_prepayment", "manual_out", "manual_in", "loan_out", "loan_repayment", "advance_out"],
       default: "manual_out",
     },
     direction: {

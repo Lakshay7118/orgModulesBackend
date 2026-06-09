@@ -32,6 +32,7 @@ const HRPayrollSchema = new mongoose.Schema(
     workingDays: { type: Number, default: 0, min: 0 },
     paidOffDays: { type: Number, default: 0, min: 0 },
     dailyRate: { type: Number, default: 0, min: 0 },
+    cameDays: { type: Number, default: 0, min: 0 },
     presentDays: { type: Number, default: 0, min: 0 },
     halfDays: { type: Number, default: 0, min: 0 },
     paidLeaveDays: { type: Number, default: 0, min: 0 },

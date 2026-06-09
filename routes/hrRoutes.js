@@ -10,10 +10,11 @@ const HRAttendance = require("../models/HRAttendance");
 const HRLoan = require("../models/HRLoan");
 const HRPayroll = require("../models/HRPayroll");
 const HRPayrollSetting = require("../models/HRPayrollSetting");
+const User = require("../models/Users");
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 
-router.use(protect, allowRoles("super_admin", "manager"));
+router.use(protect);
 
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const ALLOWED_PAYROLL_CYCLE_DAYS = [1, 7, 15];
@@ -147,6 +148,13 @@ const buildPeriodForStaff = (staff, dueDate) => {
   }
   return buildPeriodFromDueDate(dueDate, Number(dueDate.slice(8, 10)));
 };
+const payrollDueDateForSalaryMonth = (staff, salaryMonth) => {
+  const basis = normalizeSalaryBasis(staff.salaryBasis);
+  if (basis === "hourly" || basis === "daily") return dateForMonthDay(salaryMonth, 1);
+  const { year, monthIndex } = monthParts(salaryMonth);
+  const dueDate = monthDateWithCycleDay(year, monthIndex + 1, staffPayrollCycleDay(staff));
+  return formatUTCDate(dueDate);
+};
 const monthWindowForDate = (date) => {
   const parsed = parseUTCDate(date);
   const start = new Date(Date.UTC(parsed.getUTCFullYear(), parsed.getUTCMonth(), 1));
@@ -189,6 +197,16 @@ const hasPayrollSettlement = (payroll) => (
   || Boolean(payroll?.loanRepaymentApplied)
   || (Array.isArray(payroll?.paymentHistory) && payroll.paymentHistory.length > 0)
 );
+
+const loanIssueDate = (loan) => dateOnly(loan?.issueDate || loan?.createdAt);
+const payrollCanDeductLoan = (loan, period, salaryBasis) => {
+  const issueDate = loanIssueDate(loan);
+  if (!issueDate) return true;
+  if (salaryBasis === "daily" || salaryBasis === "hourly") {
+    return (period.periodStart || period.periodEnd) >= issueDate;
+  }
+  return (period.periodEnd || "") > issueDate;
+};
 
 const populateStaff = (query) => query.populate("department").sort({ createdAt: -1 });
 const populatePayroll = (query) =>
@@ -245,6 +263,18 @@ const getPayrollSetting = async () => {
     await setting.save();
   }
   return setting;
+};
+
+const findStaffForUser = async (userId) => {
+  const user = await User.findById(userId).select("name email phone").lean();
+  if (!user) return null;
+
+  const candidates = [];
+  if (user.email) candidates.push({ email: String(user.email).trim().toLowerCase() });
+  if (user.phone) candidates.push({ phone: String(user.phone).trim() });
+  if (!candidates.length) return null;
+
+  return HRStaff.findOne({ $or: candidates }).populate("department");
 };
 
 const syncPayrollIndexes = async () => {
@@ -356,13 +386,15 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
   const payableWorkHours = salaryBasis === "hourly"
     ? Math.round((roundedWorkHours + paidLeaveHours + paidShortLeaveHours) * 100) / 100
     : roundedWorkHours;
-  const missingDays = Math.max(0, workingDays - markedWorkingDays);
-  const absentDays = absentMarkedDays + missingDays;
+  const absentDays = absentMarkedDays;
+  const cameDays = presentDays + halfDays + shortLeaveDays;
   const salaryAmount = money(staff.monthlySalary);
-  const expectedWorkHours = money(
-    salaryBasis === "hourly"
-      ? payableWorkHours
-      : salaryDays * expectedHoursPerDay
+  const monthlyDailyRate = workingDays > 0 ? money(salaryAmount / workingDays) : 0;
+  const payableMarkedDays = money(
+    presentDays
+    + (halfDays * 0.5)
+    + paidLeaveDays
+    + shortLeaveDays
   );
   const baseSalary = money(
     salaryBasis === "hourly"
@@ -371,23 +403,44 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
         ? salaryAmount * workingDays
         : salaryAmount
   );
-  const dailyRate = salaryDays > 0 ? money(baseSalary / salaryDays) : 0;
+  const earnedBaseSalary = money(
+    salaryBasis === "monthly"
+      ? monthlyDailyRate * payableMarkedDays
+      : baseSalary
+  );
+  const expectedWorkHours = money(
+    salaryBasis === "hourly"
+      ? payableWorkHours
+      : salaryBasis === "monthly"
+        ? Math.max(1, workingDays) * expectedHoursPerDay
+        : salaryDays * expectedHoursPerDay
+  );
+  const dailyRate = salaryBasis === "monthly"
+    ? monthlyDailyRate
+    : salaryDays > 0 ? money(baseSalary / salaryDays) : 0;
   const hourlyRate = money(
     salaryBasis === "hourly"
       ? salaryAmount
-      : expectedWorkHours > 0 ? baseSalary / expectedWorkHours : 0
+      : salaryBasis === "monthly"
+        ? expectedHoursPerDay > 0 ? dailyRate / expectedHoursPerDay : 0
+        : expectedWorkHours > 0 ? baseSalary / expectedWorkHours : 0
   );
-  const fullDayDeduction = dailyRate * (absentDays + unpaidLeaveDays);
-  const halfDayDeduction = dailyRate * 0.5 * halfDays;
+  const fullDayDeduction = salaryBasis === "monthly" ? 0 : dailyRate * (absentDays + unpaidLeaveDays);
+  const halfDayDeduction = salaryBasis === "monthly" ? 0 : dailyRate * 0.5 * halfDays;
   const shortLeaveDeduction = hourlyRate * 2 * unpaidShortLeaveDays;
   const attendanceDeduction = salaryBasis === "hourly"
     ? 0
-    : money(fullDayDeduction + halfDayDeduction + shortLeaveDeduction);
-  const grossSalary = money(Math.max(0, baseSalary - attendanceDeduction));
+    : salaryBasis === "monthly"
+      ? money(Math.max(0, baseSalary - earnedBaseSalary) + shortLeaveDeduction)
+      : money(fullDayDeduction + halfDayDeduction + shortLeaveDeduction);
+  const grossSalary = salaryBasis === "monthly"
+    ? money(Math.max(0, earnedBaseSalary - shortLeaveDeduction))
+    : money(Math.max(0, baseSalary - attendanceDeduction));
   const payableDays = dailyRate > 0 ? Math.round((grossSalary / dailyRate) * 100) / 100 : 0;
 
   const loans = await HRLoan.find({
     staff: staff._id,
+    category: "advance",
     status: "active",
     outstanding: { $gt: 0 },
   }).sort({ issueDate: 1 });
@@ -419,13 +472,13 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
       });
     }
 
-    loans.forEach((loan) => {
+    loans.filter((loan) => payrollCanDeductLoan(loan, period, salaryBasis)).forEach((loan) => {
       if (remainingForLoans <= 0) return;
       const alreadyCutThisMonth = salaryBasis === "daily" || salaryBasis === "hourly"
         ? monthlyLoanDeductions.get(idOfDoc(loan)) || 0
         : 0;
-      const emiBalanceForThisPayroll = Math.max(0, Number(loan.emi || 0) - alreadyCutThisMonth);
-      const amount = money(Math.min(emiBalanceForThisPayroll, Number(loan.outstanding || 0), remainingForLoans));
+      const repaymentTarget = Number(loan.outstanding || 0);
+      const amount = money(Math.min(repaymentTarget, Number(loan.outstanding || 0), remainingForLoans));
       if (amount <= 0) return;
       loanDeductions.push({ loan: loan._id, amount });
       remainingForLoans = money(remainingForLoans - amount);
@@ -454,6 +507,7 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
     workingDays,
     paidOffDays,
     dailyRate,
+    cameDays,
     presentDays,
     halfDays,
     paidLeaveDays,
@@ -477,7 +531,7 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
     netPay,
     totalPaid,
     balanceDue,
-    status: balanceDue <= 0 ? "paid" : totalPaid > 0 ? "partial" : "draft",
+    status: balanceDue <= 0 && (loanDeduction <= 0 || existingPayroll?.loanRepaymentApplied) ? "paid" : totalPaid > 0 ? "partial" : "draft",
     generatedBy,
   };
 }
@@ -519,13 +573,109 @@ async function recalculateUnsettledPayrollsForStaff(staffId, userId) {
   return updatedIds.length ? populatePayroll(HRPayroll.find({ _id: { $in: updatedIds } })) : [];
 }
 
+async function createOrUpdateSalaryPaymentPayroll(staff, amount, userId, salaryMonthValue, note, bankId) {
+  const salaryMonth = validMonth(salaryMonthValue) ? salaryMonthValue : formatUTCDate(new Date()).slice(0, 7);
+  const salaryBasis = normalizeSalaryBasis(staff.salaryBasis);
+  const dueDate = salaryBasis === "daily" || salaryBasis === "hourly"
+    ? (validDate(dateOnly(new Date())) ? dateOnly(new Date()) : payrollDueDateForSalaryMonth(staff, salaryMonth))
+    : payrollDueDateForSalaryMonth(staff, salaryMonth);
+  const period = buildPeriodForStaff(staff, dueDate);
+  let payroll = await HRPayroll.findOne({ staff: staff._id, periodEnd: period.periodEnd });
+  const payrollData = await buildPayrollForStaff(staff, period, userId, payroll);
+
+  if (payrollData) {
+    payroll = payroll
+      ? Object.assign(payroll, payrollData)
+      : new HRPayroll(payrollData);
+  } else if (!payroll) {
+    payroll = new HRPayroll({
+      staff: staff._id,
+      department: staff.department?._id || staff.department || null,
+      month: period.month,
+      cycleStartDay: period.cycleStartDay,
+      periodStart: period.periodStart,
+      periodEnd: period.periodEnd,
+      periodLabel: period.periodLabel || periodLabel(period.periodStart, period.periodEnd),
+      salaryBasis,
+      salaryAmount: money(staff.monthlySalary),
+      generatedBy: userId,
+    });
+  }
+
+  const paymentEntry = {
+    bank: bankId,
+    amount,
+    paidAt: new Date(),
+    paidBy: userId,
+    note: note || "",
+  };
+  payroll.totalPaid = money(Number(payroll.totalPaid || 0) + amount);
+  payroll.balanceDue = money(Math.max(0, Number(payroll.netPay || 0) - Number(payroll.totalPaid || 0)));
+  payroll.status = payroll.balanceDue <= 0 ? "paid" : "partial";
+  payroll.bank = bankId;
+  if (payroll.status === "paid") payroll.paidAt = new Date();
+  payroll.paidBy = userId;
+  payroll.paymentHistory.push(paymentEntry);
+  await payroll.save();
+
+  return {
+    payroll,
+    payment: payroll.paymentHistory[payroll.paymentHistory.length - 1],
+  };
+}
+
+router.get("/me", allowRoles("super_admin", "manager", "user"), async (req, res) => {
+  try {
+    const staff = await findStaffForUser(req.user.id);
+    if (!staff) {
+      return res.status(404).json({ error: "No HR staff profile is linked to your account. Ask admin to match your phone or email in Staff." });
+    }
+
+    const latestPayroll = await HRPayroll.findOne({ staff: staff._id }).sort({ periodEnd: -1, createdAt: -1 }).lean();
+    const latestSalaryMonth = latestPayroll?.periodStart?.slice(0, 7)
+      || latestPayroll?.month
+      || formatUTCDate(new Date()).slice(0, 7);
+    const month = validMonth(req.query.month) ? req.query.month : latestSalaryMonth;
+    const totalDays = daysInMonth(month);
+    const attendanceFilter = {
+      staff: staff._id,
+      date: {
+        $gte: `${month}-01`,
+        $lte: `${month}-${String(totalDays).padStart(2, "0")}`,
+      },
+    };
+
+    const [attendance, payrolls] = await Promise.all([
+      HRAttendance.find(attendanceFilter).sort({ date: -1, createdAt: -1 }),
+      populatePayroll(HRPayroll.find({ staff: staff._id }).limit(120)),
+    ]);
+    const visiblePayrolls = payrolls.filter((payroll) => (
+      (payroll.periodStart || payroll.periodEnd || payroll.month || "").slice(0, 7) === month
+    ));
+
+    res.json({
+      success: true,
+      data: {
+        staff,
+        month,
+        attendance,
+        payrolls: visiblePayrolls,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.use(allowRoles("super_admin", "manager"));
+
 router.get("/summary", async (req, res) => {
   try {
     const [departmentCount, activeStaffCount, banks, loans, unpaidPayrolls] = await Promise.all([
       HRDepartment.countDocuments(),
       HRStaff.countDocuments({ status: "active" }),
       HRBank.find().lean(),
-      HRLoan.find({ status: "active", outstanding: { $gt: 0 } }).lean(),
+      HRLoan.find({ category: "advance", status: "active", outstanding: { $gt: 0 } }).lean(),
       HRPayroll.find({ status: { $in: ["draft", "partial"] } }).lean(),
     ]);
 
@@ -791,11 +941,15 @@ router.post("/attendance", async (req, res) => {
       return res.status(400).json({ error: "Staff and valid attendance date are required." });
     }
 
-    const staff = await HRStaff.findById(req.body.staff).select("salaryBasis");
+    const staff = await HRStaff.findById(req.body.staff).select("salaryBasis department").populate("department");
     if (!staff) return res.status(404).json({ error: "Staff not found" });
 
     const checkIn = req.body.checkIn || "";
     const checkOut = req.body.checkOut || "";
+    const offDays = normalizeOffDays(staff.department?.weeklyOffDays || []);
+    if (offDays.includes(parseUTCDate(req.body.date).getUTCDay()) && ["present", "absent"].includes(status)) {
+      return res.status(400).json({ error: "This date is a weekly off. Present or absent cannot be marked." });
+    }
     const isHourly = normalizeSalaryBasis(staff.salaryBasis) === "hourly";
     let workHours = req.body.workHours !== undefined
       ? toNumber(req.body.workHours, 0)
@@ -804,8 +958,8 @@ router.post("/attendance", async (req, res) => {
     if (isHourly && checkIn && checkOut) {
       workHours = calcWorkHours(checkIn, checkOut);
     }
-    if (isHourly && status === "present" && (!checkIn || !checkOut)) {
-      return res.status(400).json({ error: "Check-in and check-out are required for hourly staff." });
+    if (isHourly && status === "present" && workHours <= 0 && (!checkIn || !checkOut)) {
+      return res.status(400).json({ error: "Work hours are required for hourly staff." });
     }
     if (workHours < 0) {
       return res.status(400).json({ error: "Work hours cannot be negative." });
@@ -1029,6 +1183,8 @@ router.post("/banks/:id/payment", async (req, res) => {
     let transactionType = direction === "in" ? "manual_in" : "manual_out";
     let beneficiaryName = (req.body.beneficiaryName || "").trim();
     let loanOutstandingAfter = 0;
+    let payroll = null;
+    let payrollPayment = null;
 
     if (partyType === "employee") {
       if (!req.body.staff) return res.status(400).json({ error: "Select an employee" });
@@ -1037,32 +1193,34 @@ router.post("/banks/:id/payment", async (req, res) => {
       department = staff.department?._id || staff.department || null;
       beneficiaryName = staff.name || beneficiaryName || "Employee";
 
-      if (direction === "out" && ["loan", "advance"].includes(req.body.purpose)) {
-        const emi = money(req.body.emi);
-        if (emi <= 0) return res.status(400).json({ error: "Salary deduction amount must be greater than 0" });
-        if (emi > amount) return res.status(400).json({ error: "Deduction amount cannot be greater than the payment amount" });
+      if (direction === "out" && req.body.purpose === "loan") {
+        return res.status(400).json({ error: "Use employee advance instead." });
+      }
+
+      if (direction === "out" && req.body.purpose === "advance") {
+        const emi = amount;
 
         loan = await HRLoan.create({
           staff: staff._id,
           amount,
           outstanding: amount,
           emi,
-          category: req.body.purpose === "advance" ? "advance" : "loan",
+          category: "advance",
           issueDate: req.body.issueDate || Date.now(),
           note,
           status: "active",
           createdBy: req.user.id,
         });
-        transactionType = req.body.purpose === "advance" ? "advance_out" : "loan_out";
+        transactionType = "advance_out";
         loanOutstandingAfter = money(loan.outstanding);
       } else if (req.body.loan) {
         loan = await HRLoan.findById(req.body.loan);
-        if (!loan) return res.status(404).json({ error: "Loan not found" });
+        if (!loan || loan.category !== "advance") return res.status(404).json({ error: "Advance not found" });
         if (idOfDoc(loan.staff) !== idOfDoc(staff._id)) {
-          return res.status(400).json({ error: "Selected loan does not belong to this employee" });
+          return res.status(400).json({ error: "Selected advance does not belong to this employee" });
         }
         if (loan.status !== "active" || Number(loan.outstanding || 0) <= 0) {
-          return res.status(400).json({ error: "Selected loan is already closed" });
+          return res.status(400).json({ error: "Selected advance is already closed" });
         }
         const repayment = money(Math.min(amount, Number(loan.outstanding || 0)));
         loan.outstanding = money(Math.max(0, Number(loan.outstanding || 0) - repayment));
@@ -1071,6 +1229,18 @@ router.post("/banks/:id/payment", async (req, res) => {
         await loan.save();
         transactionType = "loan_repayment";
         loanOutstandingAfter = money(loan.outstanding);
+      } else if (direction === "out" && req.body.purpose === "salary") {
+        const salaryPayment = await createOrUpdateSalaryPaymentPayroll(
+          staff,
+          amount,
+          req.user.id,
+          req.body.salaryMonth,
+          note,
+          bank._id
+        );
+        payroll = salaryPayment.payroll;
+        payrollPayment = salaryPayment.payment;
+        transactionType = "salary_prepayment";
       }
     } else {
       if (!beneficiaryName) {
@@ -1089,6 +1259,11 @@ router.post("/banks/:id/payment", async (req, res) => {
       staff: staff?._id,
       department,
       loan: loan?._id,
+      payroll: payroll?._id,
+      paymentHistoryId: payrollPayment?._id,
+      payrollPeriodLabel: payroll?.periodLabel || payroll?.periodEnd || payroll?.month || "",
+      grossSalary: payroll ? money(payroll.grossSalary) : 0,
+      netPay: payroll ? money(payroll.netPay) : 0,
       beneficiaryName,
       beneficiaryAccount,
       note,
@@ -1102,10 +1277,14 @@ router.post("/banks/:id/payment", async (req, res) => {
       { path: "staff" },
       { path: "department" },
       { path: "loan" },
+      { path: "payroll", populate: [{ path: "loanDeductions.loan" }] },
     ]);
     if (loan) await loan.populate({ path: "staff", populate: { path: "department" } });
     const recalculatedPayrolls = loan && direction === "out"
       ? await recalculateUnsettledPayrollsForStaff(staff._id, req.user.id)
+      : [];
+    const paidPayrolls = payroll
+      ? await populatePayroll(HRPayroll.find({ _id: payroll._id }))
       : [];
 
     res.json({
@@ -1113,7 +1292,7 @@ router.post("/banks/:id/payment", async (req, res) => {
       data: attachSalaryTransactionDetails(transaction.toObject()),
       bank,
       loan,
-      payrolls: recalculatedPayrolls,
+      payrolls: paidPayrolls.length ? paidPayrolls : recalculatedPayrolls,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1122,7 +1301,7 @@ router.post("/banks/:id/payment", async (req, res) => {
 
 router.get("/loans", async (req, res) => {
   try {
-    const filter = {};
+    const filter = { category: "advance" };
     if (req.query.staff) filter.staff = req.query.staff;
     const loans = await HRLoan.find(filter)
       .populate({ path: "staff", populate: { path: "department" } })
@@ -1136,7 +1315,8 @@ router.get("/loans", async (req, res) => {
 router.post("/loans", async (req, res) => {
   try {
     const amount = money(req.body.amount);
-    const emi = money(req.body.emi);
+    const category = "advance";
+    const emi = amount;
     if (amount <= 0 || emi <= 0) {
       return res.status(400).json({ error: "Amount and deduction must be greater than 0" });
     }
@@ -1145,14 +1325,15 @@ router.post("/loans", async (req, res) => {
       amount,
       outstanding: req.body.outstanding !== undefined ? money(req.body.outstanding) : amount,
       emi,
-      category: req.body.category === "advance" ? "advance" : "loan",
+      category,
       issueDate: req.body.issueDate || Date.now(),
       note: req.body.note || "",
       status: "active",
       createdBy: req.user.id,
     });
     await loan.populate({ path: "staff", populate: { path: "department" } });
-    res.status(201).json({ success: true, data: loan });
+    const recalculatedPayrolls = await recalculateUnsettledPayrollsForStaff(loan.staff._id || loan.staff, req.user.id);
+    res.status(201).json({ success: true, data: loan, payrolls: recalculatedPayrolls });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1164,7 +1345,7 @@ router.patch("/loans/:id", async (req, res) => {
     ["note", "status"].forEach((field) => {
       if (req.body[field] !== undefined) updates[field] = req.body[field];
     });
-    if (req.body.category !== undefined) updates.category = req.body.category === "advance" ? "advance" : "loan";
+    if (req.body.category !== undefined) updates.category = "advance";
     if (req.body.emi !== undefined) updates.emi = money(req.body.emi);
     if (req.body.outstanding !== undefined) updates.outstanding = money(req.body.outstanding);
     const loan = await HRLoan.findByIdAndUpdate(req.params.id, updates, {
@@ -1232,10 +1413,6 @@ router.post("/payroll/generate", async (req, res) => {
       if (!isStaffPayrollDueOnDate(staff, dueDate)) continue;
       const period = buildPeriodForStaff(staff, dueDate);
       const existing = await HRPayroll.findOne({ staff: staff._id, periodEnd: period.periodEnd });
-      if (existing?.status === "paid" && hasPayrollSettlement(existing)) {
-        results.push(existing);
-        continue;
-      }
 
       const payrollData = await buildPayrollForStaff(staff, period, req.user.id, existing);
       if (!payrollData) continue;
@@ -1260,7 +1437,9 @@ router.post("/payroll/:id/pay", async (req, res) => {
   try {
     const payroll = await HRPayroll.findById(req.params.id);
     if (!payroll) return res.status(404).json({ error: "Payroll not found" });
-    if (payroll.status === "paid") return res.status(400).json({ error: "Payroll is already paid" });
+    if (payroll.status === "paid" && hasPayrollSettlement(payroll)) {
+      return res.status(400).json({ error: "Payroll is already paid" });
+    }
     payroll.salaryBasis = normalizeSalaryBasis(payroll.salaryBasis);
 
     if (!hasPayrollSettlement(payroll)) {
@@ -1291,22 +1470,32 @@ router.post("/payroll/:id/pay", async (req, res) => {
         }
       }
     }
-    if (payroll.status === "paid") return res.status(400).json({ error: "Payroll is already paid" });
+    if (payroll.status === "paid" && hasPayrollSettlement(payroll)) {
+      return res.status(400).json({ error: "Payroll is already paid" });
+    }
 
     const payAmount = money(req.body.amount === undefined ? payroll.balanceDue : req.body.amount);
-    if (payAmount <= 0) return res.status(400).json({ error: "Payment amount must be greater than 0" });
+    const deductionOnlySettlement = payAmount <= 0
+      && Number(payroll.balanceDue || 0) <= 0
+      && !payroll.loanRepaymentApplied
+      && loanDeductionsSnapshot(payroll).length > 0;
+    if (payAmount <= 0 && !deductionOnlySettlement) {
+      return res.status(400).json({ error: "Payment amount must be greater than 0" });
+    }
     if (payAmount > Number(payroll.balanceDue || 0)) {
       return res.status(400).json({ error: "Payment amount cannot be greater than current due" });
     }
 
-    const bank = await HRBank.findById(req.body.bankId);
-    if (!bank) return res.status(404).json({ error: "Bank not found" });
-    if (Number(bank.balance || 0) < payAmount) {
+    const bank = payAmount > 0 ? await HRBank.findById(req.body.bankId) : null;
+    if (payAmount > 0 && !bank) return res.status(404).json({ error: "Bank not found" });
+    if (bank && Number(bank.balance || 0) < payAmount) {
       return res.status(400).json({ error: "Selected bank does not have enough balance" });
     }
 
-    bank.balance = money(Number(bank.balance || 0) - payAmount);
-    await bank.save();
+    if (bank) {
+      bank.balance = money(Number(bank.balance || 0) - payAmount);
+      await bank.save();
+    }
 
     const paymentLoanDeductions = !payroll.loanRepaymentApplied ? loanDeductionsSnapshot(payroll) : [];
     const paymentLoanDeduction = money(paymentLoanDeductions.reduce((sum, item) => sum + item.amount, 0));
@@ -1327,11 +1516,11 @@ router.post("/payroll/:id/pay", async (req, res) => {
     payroll.totalPaid = money(Number(payroll.totalPaid || 0) + payAmount);
     payroll.balanceDue = money(Math.max(0, Number(payroll.netPay || 0) - Number(payroll.totalPaid || 0)));
     payroll.status = payroll.balanceDue <= 0 ? "paid" : "partial";
-    payroll.bank = bank._id;
+    if (bank) payroll.bank = bank._id;
     if (payroll.status === "paid") payroll.paidAt = new Date();
     payroll.paidBy = req.user.id;
     const paymentEntry = {
-      bank: bank._id,
+      bank: bank?._id,
       amount: payAmount,
       paidAt: new Date(),
       paidBy: req.user.id,
@@ -1342,37 +1531,40 @@ router.post("/payroll/:id/pay", async (req, res) => {
 
     const savedPayment = payroll.paymentHistory[payroll.paymentHistory.length - 1];
     const staff = await HRStaff.findById(payroll.staff).populate("department").lean();
-    const transaction = await HRBankTransaction.create({
-      bank: bank._id,
-      type: "salary",
-      direction: "out",
-      amount: payAmount,
-      staff: payroll.staff,
-      department: payroll.department || staff?.department?._id || staff?.department || null,
-      payroll: payroll._id,
-      paymentHistoryId: savedPayment?._id,
-      payrollPeriodLabel: payroll.periodLabel || payroll.periodEnd || payroll.month || "",
-      grossSalary: money(payroll.grossSalary),
-      netPay: money(payroll.netPay),
-      loanDeduction: paymentLoanDeduction,
-      loanDeductions: paymentLoanDeductions,
-      beneficiaryName: staff?.name || "Staff",
-      beneficiaryAccount: "",
-      note: req.body.note || "",
-      paidAt: savedPayment?.paidAt || new Date(),
-      paidBy: req.user.id,
-      bankBalanceAfter: bank.balance,
-    });
-    await transaction.populate([
-      { path: "bank" },
-      { path: "staff" },
-      { path: "department" },
-      { path: "payroll", populate: [{ path: "loanDeductions.loan" }] },
-      { path: "loanDeductions.loan" },
-    ]);
+    let transaction = null;
+    if (bank) {
+      transaction = await HRBankTransaction.create({
+        bank: bank._id,
+        type: "salary",
+        direction: "out",
+        amount: payAmount,
+        staff: payroll.staff,
+        department: payroll.department || staff?.department?._id || staff?.department || null,
+        payroll: payroll._id,
+        paymentHistoryId: savedPayment?._id,
+        payrollPeriodLabel: payroll.periodLabel || payroll.periodEnd || payroll.month || "",
+        grossSalary: money(payroll.grossSalary),
+        netPay: money(payroll.netPay),
+        loanDeduction: paymentLoanDeduction,
+        loanDeductions: paymentLoanDeductions,
+        beneficiaryName: staff?.name || "Staff",
+        beneficiaryAccount: "",
+        note: req.body.note || "",
+        paidAt: savedPayment?.paidAt || new Date(),
+        paidBy: req.user.id,
+        bankBalanceAfter: bank.balance,
+      });
+      await transaction.populate([
+        { path: "bank" },
+        { path: "staff" },
+        { path: "department" },
+        { path: "payroll", populate: [{ path: "loanDeductions.loan" }] },
+        { path: "loanDeductions.loan" },
+      ]);
+    }
 
     const populated = await populatePayroll(HRPayroll.findById(payroll._id));
-    res.json({ success: true, data: populated, bank, transaction: attachSalaryTransactionDetails(transaction.toObject()) });
+    res.json({ success: true, data: populated, bank, transaction: transaction ? attachSalaryTransactionDetails(transaction.toObject()) : null });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
