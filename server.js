@@ -41,6 +41,16 @@ app.get("/api/health", (req, res) => {
   });
 }); 
 
+app.get("/api/deploy-check", (req, res) => {
+  res.json({
+    success: true,
+    service: "whatsapp-backend",
+    serverFile: "backend/server.js",
+    hrRoutesMountedAt: "/api/hr",
+    deployedAt: "2026-06-10-hr-routes-check",
+  });
+});
+
 // 🔥 CORS
 app.use(cors({ origin: "*" }));
 
