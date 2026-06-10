@@ -14,6 +14,15 @@ const User = require("../models/Users");
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 
+router.get("/ping", (req, res) => {
+  res.json({
+    success: true,
+    message: "HR routes loaded",
+  });
+});
+
+router.use(protect);
+
 router.use(protect);
 
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];

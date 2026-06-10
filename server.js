@@ -29,6 +29,9 @@ require("./jobs/taskReminder");
 const app = express();
 const server = http.createServer(app);
 
+console.log("BOOTING SERVER FILE:", __filename);
+console.log("DEPLOY VERSION:", "2026-06-10-hr-deploy-check-v2");
+
 app.use((req, res, next) => {
   console.log("REQ HIT:", req.method, req.originalUrl);
   next();
