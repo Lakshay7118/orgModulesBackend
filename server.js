@@ -94,6 +94,7 @@ app.get("/", (req, res) => {
   res.send("Backend running 🚀");
 });
 
+console.log("Routes mounted successfully");
 // Start cron jobs
 require("./jobs/campaignScheduler");
 
