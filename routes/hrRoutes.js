@@ -14,20 +14,13 @@ const User = require("../models/Users");
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 
-router.get("/ping", (req, res) => {
-  res.json({
-    success: true,
-    message: "HR routes loaded",
-  });
-});
 
 router.use(protect);
 
-router.use(protect);
 
 const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const ALLOWED_PAYROLL_CYCLE_DAYS = [1, 7, 15];
-const ATTENDANCE_STATUSES = ["present", "absent", "half_day", "paid_leave", "short_leave"];
+const ATTENDANCE_STATUSES = ["present", "absent", "half_day", "paid_leave", "short_leave", "weekly_off"];
 let payrollIndexSyncPromise = null;
 
 const money = (value) => Math.max(0, Math.round((Number(value) || 0) * 100) / 100);
@@ -98,6 +91,16 @@ const dateOnly = (date) => {
   return Number.isNaN(parsed.getTime()) ? "" : formatUTCDate(parsed);
 };
 const isObjectId = (value) => !value || mongoose.Types.ObjectId.isValid(value);
+const optionalString = (value) => (value === undefined || value === null ? "" : String(value).trim());
+const optionalUpperString = (value) => optionalString(value).toUpperCase();
+const normalizeStaffAddress = (address = {}) => ({
+  countryCode: optionalUpperString(address.countryCode),
+  countryName: optionalString(address.countryName),
+  stateCode: optionalString(address.stateCode),
+  stateName: optionalString(address.stateName),
+  cityName: optionalString(address.cityName),
+  houseAddress: optionalString(address.houseAddress),
+});
 const sendHrError = (res, error, fallback = "HR request failed") => {
   if (error?.code === 11000) {
     const field = Object.keys(error.keyPattern || error.keyValue || {})[0] || "field";
@@ -332,14 +335,15 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
   const effectiveStart = joinDate && joinDate > attendanceStart ? joinDate : attendanceStart;
   if (effectiveStart >= attendanceEnd) return null;
 
-  const periodDates = eachDateInPeriod(attendanceStart, attendanceEnd).map((dateMeta) => ({
+  const fullPeriodDates = eachDateInPeriod(attendanceStart, attendanceEnd).map((dateMeta) => ({
     ...dateMeta,
     isOff: offDays.includes(dateMeta.weekday),
-  })).filter((dateMeta) => dateMeta.date >= effectiveStart);
+  }));
+  const periodDates = fullPeriodDates.filter((dateMeta) => dateMeta.date >= effectiveStart);
 
   const workingDays = salaryBasis === "hourly" ? periodDates.length : periodDates.filter((date) => !date.isOff).length;
   const paidOffDays = periodDates.length - workingDays;
-  const salaryDays = salaryBasis === "monthly" ? periodDates.length : workingDays;
+  const salaryDays = salaryBasis === "monthly" ? fullPeriodDates.length : workingDays;
   const attendance = await HRAttendance.find({
     staff: staff._id,
     date: { $gte: effectiveStart, $lt: attendanceEnd },
@@ -350,6 +354,8 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
   let halfDays = 0;
   let paidLeaveRequests = 0;
   let shortLeaveDays = 0;
+  let weeklyOffMarkedDays = 0;
+  let weeklyOffMarkedOffDays = 0;
   let absentMarkedDays = 0;
   let unpaidLeaveDays = 0;
   let totalWorkHours = 0;
@@ -359,11 +365,11 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
   const shortLeaveRecords = [];
 
   periodDates.forEach((dateMeta) => {
-    if (dateMeta.isOff && salaryBasis !== "hourly") return;
     const record = attendanceByDate.get(dateMeta.date);
+    if (dateMeta.isOff && salaryBasis !== "hourly" && record?.status !== "weekly_off") return;
     if (!record) return;
     const recordWorkHours = Number(record.workHours || 0);
-    markedWorkingDays += 1;
+    if (record.status !== "weekly_off") markedWorkingDays += 1;
     totalWorkHours += recordWorkHours;
     attendanceOvertimeHours += Number(record.overtimeHours || 0);
     attendanceFineHours += Number(record.fineHours || 0);
@@ -371,6 +377,10 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
     if (record.status === "absent") absentMarkedDays += 1;
     if (record.status === "half_day") halfDays += 1;
     if (record.status === "paid_leave") paidLeaveRequests += 1;
+    if (record.status === "weekly_off") {
+      weeklyOffMarkedDays += 1;
+      if (dateMeta.isOff) weeklyOffMarkedOffDays += 1;
+    }
     if (record.status === "short_leave") {
       shortLeaveDays += 1;
       shortLeaveRecords.push({ workHours: recordWorkHours });
@@ -387,6 +397,7 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
   const unpaidShortLeaveDays = Math.max(0, shortLeaveDays - fullyPaidShortLeaves);
   const roundedWorkHours = Math.round(totalWorkHours * 100) / 100;
   const paidLeaveHours = salaryBasis === "hourly" ? paidLeaveDays * expectedHoursPerDay : 0;
+  const weeklyOffPayableDays = weeklyOffMarkedDays;
   const paidShortLeaveHours = salaryBasis === "hourly"
     ? shortLeaveRecords
       .slice(0, fullyPaidShortLeaves)
@@ -404,12 +415,13 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
     + (halfDays * 0.5)
     + paidLeaveDays
     + shortLeaveDays
+    + weeklyOffPayableDays
   );
   const baseSalary = money(
     salaryBasis === "hourly"
       ? salaryAmount * payableWorkHours
       : salaryBasis === "daily"
-        ? salaryAmount * workingDays
+        ? salaryAmount * (workingDays + weeklyOffMarkedOffDays)
         : salaryAmount
   );
   const earnedBaseSalary = money(
@@ -815,6 +827,16 @@ router.get("/staff", async (req, res) => {
   }
 });
 
+router.get("/staff/:id", async (req, res) => {
+  try {
+    const staff = await populateStaff(HRStaff.findById(req.params.id));
+    if (!staff) return res.status(404).json({ error: "Staff not found" });
+    res.json({ success: true, data: staff });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.post("/staff", async (req, res) => {
   try {
     const name = String(req.body.name || "").trim();
@@ -828,6 +850,13 @@ router.post("/staff", async (req, res) => {
       name,
       email: req.body.email || "",
       phone: req.body.phone || "",
+      address: normalizeStaffAddress(req.body.address),
+      bankName: optionalString(req.body.bankName),
+      accountHolderName: optionalString(req.body.accountHolderName),
+      accountNumber: optionalString(req.body.accountNumber),
+      ifscCode: optionalUpperString(req.body.ifscCode),
+      branch: optionalString(req.body.branch),
+      upiId: optionalString(req.body.upiId),
       department,
       designation: req.body.designation || "",
       monthlySalary: money(req.body.monthlySalary),
@@ -856,6 +885,13 @@ router.patch("/staff/:id", async (req, res) => {
       "name",
       "email",
       "phone",
+      "address",
+      "bankName",
+      "accountHolderName",
+      "accountNumber",
+      "ifscCode",
+      "branch",
+      "upiId",
       "department",
       "designation",
       "salaryBasis",
@@ -867,6 +903,12 @@ router.patch("/staff/:id", async (req, res) => {
     });
     if (updates.name !== undefined) updates.name = String(updates.name || "").trim();
     if (updates.employeeCode !== undefined) updates.employeeCode = String(updates.employeeCode || "").trim() || undefined;
+    ["email", "phone", "bankName", "accountHolderName", "accountNumber", "branch", "upiId"].forEach((field) => {
+      if (updates[field] !== undefined) updates[field] = optionalString(updates[field]);
+    });
+    if (updates.email) updates.email = updates.email.toLowerCase();
+    if (updates.address !== undefined) updates.address = normalizeStaffAddress(updates.address);
+    if (updates.ifscCode !== undefined) updates.ifscCode = optionalUpperString(updates.ifscCode);
     if (updates.department !== undefined && !isObjectId(updates.department)) {
       return res.status(400).json({ error: "Invalid department." });
     }
@@ -967,6 +1009,9 @@ router.post("/attendance", async (req, res) => {
     if (isHourly && checkIn && checkOut) {
       workHours = calcWorkHours(checkIn, checkOut);
     }
+    if (status === "weekly_off") {
+      workHours = 0;
+    }
     if (isHourly && status === "present" && workHours <= 0 && (!checkIn || !checkOut)) {
       return res.status(400).json({ error: "Work hours are required for hourly staff." });
     }
@@ -978,8 +1023,8 @@ router.post("/attendance", async (req, res) => {
       { staff: req.body.staff, date: req.body.date },
       {
         status,
-        checkIn,
-        checkOut,
+        checkIn: status === "weekly_off" ? "" : checkIn,
+        checkOut: status === "weekly_off" ? "" : checkOut,
         workHours,
         overtimeHours: Math.max(0, toNumber(req.body.overtimeHours, 0)),
         fineHours: Math.max(0, toNumber(req.body.fineHours, 0)),

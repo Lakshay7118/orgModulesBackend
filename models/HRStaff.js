@@ -24,6 +24,70 @@ const HRStaffSchema = new mongoose.Schema(
       trim: true,
       default: "",
     },
+    address: {
+      countryCode: {
+        type: String,
+        trim: true,
+        uppercase: true,
+        default: "",
+      },
+      countryName: {
+        type: String,
+        trim: true,
+        default: "",
+      },
+      stateCode: {
+        type: String,
+        trim: true,
+        default: "",
+      },
+      stateName: {
+        type: String,
+        trim: true,
+        default: "",
+      },
+      cityName: {
+        type: String,
+        trim: true,
+        default: "",
+      },
+      houseAddress: {
+        type: String,
+        trim: true,
+        default: "",
+      },
+    },
+    bankName: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    accountHolderName: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    accountNumber: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    ifscCode: {
+      type: String,
+      trim: true,
+      uppercase: true,
+      default: "",
+    },
+    branch: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    upiId: {
+      type: String,
+      trim: true,
+      default: "",
+    },
     department: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "HRDepartment",

@@ -14,7 +14,7 @@ const HRAttendanceSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["present", "absent", "half_day", "paid_leave", "short_leave"],
+      enum: ["present", "absent", "half_day", "paid_leave", "short_leave", "weekly_off"],
       default: "present",
     },
     checkIn: {
