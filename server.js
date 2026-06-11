@@ -92,9 +92,9 @@ app.use("/api/rtc", rtcRoutes);
 // Test route
 app.get("/", (req, res) => {
   res.send("Backend running 🚀");
+  console.log("Routes mounted successfully");
 });
 
-console.log("Routes mounted successfully");
 // Start cron jobs
 require("./jobs/campaignScheduler");
 
