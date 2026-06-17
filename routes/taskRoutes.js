@@ -8,6 +8,9 @@ const UserTaskStatus = require("../models/UserTaskStatus");
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 
+const TOP_ADMIN_ROLES = ["super_to_super_admin", "super_admin"];
+const isTopAdmin = (role) => TOP_ADMIN_ROLES.includes(role);
+
 const TASK_UPDATE_FIELDS = [
   "title", "description", "dueDate", "reminderAt", "reminders", "priority",
   "attachments", "inputFields", "dropdownButtons", "quickReplies",
@@ -100,7 +103,7 @@ router.get("/", protect, async (req, res) => {
 
     let filter = {};
 
-    if (userRole === "super_admin") {
+    if (isTopAdmin(userRole)) {
       filter = {};
     } else if (userRole === "manager") {
       filter = {
@@ -231,7 +234,7 @@ router.post("/", protect, allowRoles("super_admin", "manager", "user"), async (r
       }
     } else {
       // Notify all admins that a task is pending their approval
-      const admins = await User.find({ role: "super_admin" }).select("_id").lean();
+      const admins = await User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
       for (const admin of admins) {
         const creator = await User.findById(req.user.id).select("name").lean();
         const notif = await Notification.create({
@@ -384,7 +387,7 @@ router.put("/:id", protect, allowRoles("super_admin", "manager"), async (req, re
     if (!task) return res.status(404).json({ error: "Task not found" });
 
     const isCreator = task.createdBy.toString() === req.user.id;
-    const isAdmin = req.user.role === "super_admin";
+    const isAdmin = isTopAdmin(req.user.role);
     if (!isCreator && !isAdmin) {
       return res.status(403).json({ error: "Not authorized" });
     }
@@ -403,7 +406,7 @@ router.put("/:id", protect, allowRoles("super_admin", "manager"), async (req, re
         .populate("pendingUpdate.requestedBy", "name phone role");
 
       const io = getIO();
-      const admins = await User.find({ role: "super_admin" }).select("_id").lean();
+      const admins = await User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
       admins.forEach((admin) => {
         io.to(admin._id.toString()).emit("taskUpdated", populatedTask);
       });
@@ -433,7 +436,7 @@ router.put("/:id", protect, allowRoles("super_admin", "manager"), async (req, re
         .populate("pendingUpdate.requestedBy", "name phone role");
 
       const io = getIO();
-      const admins = await User.find({ role: "super_admin" }).select("_id").lean();
+      const admins = await User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
       const creator = await User.findById(req.user.id).select("name").lean();
       for (const admin of admins) {
         const notif = await Notification.create({
@@ -485,7 +488,7 @@ router.delete("/:id", protect, allowRoles("super_admin", "manager"), async (req,
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: "Task not found" });
 
-    const isAdmin = req.user.role === "super_admin";
+    const isAdmin = isTopAdmin(req.user.role);
     const isCreator = task.createdBy.toString() === req.user.id;
 
     // Managers can only delete their own tasks (e.g. after rejection)
@@ -517,7 +520,7 @@ router.post("/:id/response", protect, async (req, res) => {
 
     const isAssignee = task.assignedTo.some((id) => id.toString() === req.user.id);
     const isCreator = task.createdBy.toString() === req.user.id;
-    const isAdmin = req.user.role === "super_admin";
+    const isAdmin = isTopAdmin(req.user.role);
     if (!isAssignee && !isCreator && !isAdmin) {
       return res.status(403).json({ error: "Not authorized" });
     }
@@ -630,7 +633,7 @@ router.patch("/:id/status", protect, async (req, res) => {
 
     const isAssignee = task.assignedTo.some((id) => id.toString() === req.user.id);
     const isCreator = task.createdBy.toString() === req.user.id;
-    const isAdmin = req.user.role === "super_admin";
+    const isAdmin = isTopAdmin(req.user.role);
     if (!isAssignee && !isCreator && !isAdmin) {
       return res.status(403).json({ error: "Not authorized" });
     }
@@ -726,15 +729,15 @@ router.get("/user-statuses", protect, async (req, res) => {
     const userRole = req.user.role;
 
     let taskFilter = {};
-    if (userRole !== "super_admin") {
+    if (!isTopAdmin(userRole)) {
       taskFilter = { assignedTo: userId };
     }
     const visibleTaskIds = (await Task.find(taskFilter).select("_id").lean())
       .map(t => t._id.toString());
 
     const statuses = await UserTaskStatus.find({
-      userId: { $in: userRole === "super_admin"
-        ? (await User.find({ role: { $ne: "super_admin" } }).select("_id"))
+      userId: { $in: isTopAdmin(userRole)
+        ? (await User.find({ role: { $nin: TOP_ADMIN_ROLES } }).select("_id"))
         : [userId] },
       taskId: { $in: visibleTaskIds },
     }).lean();
@@ -752,7 +755,7 @@ router.patch("/:id/user-status", protect, async (req, res) => {
     if (!task) return res.status(404).json({ error: "Task not found" });
 
     const isAssignee = task.assignedTo.some(a => a.toString() === req.user.id);
-    if (!isAssignee && req.user.role !== "super_admin")
+    if (!isAssignee && !isTopAdmin(req.user.role))
       return res.status(403).json({ error: "Not assigned" });
 
     const { status } = req.body;

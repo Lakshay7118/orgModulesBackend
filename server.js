@@ -20,6 +20,9 @@ const campaignRoutes = require("./routes/campaignRoutes");
 const tagRoutes = require("./routes/tagRoutes");
 const taskRoutes = require("./routes/taskRoutes");
 const hrRoutes = require("./routes/hrRoutes");
+const organizationRoutes = require("./routes/organizationRoutes");
+const protect = require("./middleware/authMiddleware");
+const requireModule = require("./middleware/moduleMiddleware");
 const notificationRoutes =
 require("./routes/notificationRoutes");
 const rtcRoutes = require("./routes/rtcRoutes");
@@ -72,27 +75,27 @@ const io = initSocket(server);
 app.set("io", io);
 
 // Routes
-app.use("/api/messages", messageRoutes);
-app.use("/api/chats", chatRoutes);
+app.use("/api/messages", protect, requireModule("chat"), messageRoutes);
+app.use("/api/chats", protect, requireModule("chat"), chatRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api", contactRoutes);
 app.use("/api/upload", uploadRoutes);
-app.use("/api", templateRoutes);
-app.use("/api", campaignRoutes);
 app.use("/api", tagRoutes);
-app.use("/api/groups", groupRoutes);
-app.use("/api/tasks", taskRoutes);
-app.use("/api/hr", hrRoutes);
+app.use("/api/groups", protect, requireModule("chat"), groupRoutes);
+app.use("/api/organizations", organizationRoutes);
+app.use("/api/tasks", protect, requireModule("task"), taskRoutes);
+app.use("/api/hr", protect, hrRoutes);
 app.use(
   "/api/notifications",
   notificationRoutes
 );
 app.use("/api/rtc", rtcRoutes);
+app.use("/api", protect, requireModule("chat"), templateRoutes);
+app.use("/api", protect, requireModule("chat"), campaignRoutes);
 
 // Test route
 app.get("/", (req, res) => {
   res.send("Backend running 🚀");
-  console.log("Routes mounted successfully");
 });
 
 // Start cron jobs

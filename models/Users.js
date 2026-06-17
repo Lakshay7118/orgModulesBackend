@@ -7,8 +7,17 @@ const UserSchema = new mongoose.Schema({
   phone: { type: String, unique: true, sparse: true },
   role: {
     type: String,
-    enum: ["super_admin", "manager", "user"],
+    enum: ["super_to_super_admin", "super_admin", "manager", "hr", "user"],
     default: "user",
+  },
+  organization: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Organization",
+  },
+  allowedModules: {
+    type: [String],
+    enum: ["hr", "task", "chat"],
+    default: [],
   },
   isActive: { type: Boolean, default: true },
   createdBy: {

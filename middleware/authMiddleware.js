@@ -7,7 +7,9 @@ const protect = async (req, res, next) => {
       const token = req.headers.authorization.split(" ")[1];
 
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      const user = await User.findById(decoded.id).select("isActive").lean();
+      const user = await User.findById(decoded.id)
+        .select("name phone email role isActive organization allowedModules")
+        .lean();
 
       if (!user) {
         return res.status(401).json({ message: "Invalid token" });
@@ -17,7 +19,17 @@ const protect = async (req, res, next) => {
         return res.status(403).json({ message: "Account inactive. Contact admin." });
       }
 
-      req.user = decoded;
+      req.user = {
+        ...decoded,
+        id: user._id.toString(),
+        name: user.name,
+        phone: user.phone,
+        email: user.email,
+        role: user.role,
+        organization: user.organization,
+        allowedModules: user.allowedModules || [],
+        isActive: user.isActive !== false,
+      };
       return next();
     }
 

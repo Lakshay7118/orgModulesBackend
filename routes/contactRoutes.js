@@ -8,6 +8,58 @@ const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 const router = express.Router();
 
+const TOP_ADMIN_ROLES = ["super_to_super_admin", "super_admin"];
+const HIDDEN_CONTACT_ROLES = ["super_to_super_admin"];
+
+const sameId = (left, right) =>
+  left && right && String(left) === String(right);
+
+const isTopAdmin = (role) => TOP_ADMIN_ROLES.includes(role);
+
+const getOrganizationContactScope = async (req) => {
+  if (req.user.role === "super_to_super_admin") return {};
+
+  if (!req.user.organization) {
+    return { createdBy: req.user.id };
+  }
+
+  const orgUsers = await User.find({ organization: req.user.organization }).select("_id").lean();
+  const orgUserIds = orgUsers.map((user) => user._id);
+
+  return {
+    $or: [
+      { organization: req.user.organization },
+      { organization: null, createdBy: { $in: orgUserIds } },
+    ],
+  };
+};
+
+const mergeContactFilter = async (req, filter = {}) => {
+  const scope = await getOrganizationContactScope(req);
+  return Object.keys(scope).length ? { $and: [scope, filter] } : filter;
+};
+
+const canAccessContact = async (req, contact) => {
+  if (req.user.role === "super_to_super_admin") return true;
+  if (!contact) return false;
+
+  if (sameId(contact.organization, req.user.organization)) return true;
+
+  if (!contact.organization && contact.createdBy) {
+    const creatorId = contact.createdBy._id || contact.createdBy;
+    const creator = await User.findById(creatorId).select("organization").lean();
+    return sameId(creator?.organization, req.user.organization);
+  }
+
+  return false;
+};
+
+const hideSystemContacts = (contacts = []) =>
+  contacts.filter((contact) => {
+    const role = contact.loginUser?.role || contact.role || contact.createdBy?.role || "";
+    return !HIDDEN_CONTACT_ROLES.includes(role);
+  });
+
 const attachLoginUsers = async (contacts = []) => {
   const plainContacts = contacts.map((contact) =>
     typeof contact.toObject === "function" ? contact.toObject() : contact
@@ -37,9 +89,17 @@ const attachLoginUsers = async (contacts = []) => {
 };
 
 // ── Shared helpers ───────────────────────────────────────────────
-async function notifyAdmins({ type, message, contactId }) {
+async function notifyAdmins({ type, message, contactId, organization }) {
   const io = getIO();
-  const admins = await User.find({ role: "super_admin" }).select("_id").lean();
+  const query = organization
+    ? {
+        $or: [
+          { role: "super_to_super_admin" },
+          { role: "super_admin", organization },
+        ],
+      }
+    : { role: { $in: TOP_ADMIN_ROLES } };
+  const admins = await User.find(query).select("_id").lean();
   for (const admin of admins) {
     const notif = await Notification.create({ userId: admin._id, type, message, contactId });
     io.to(admin._id.toString()).emit("newNotification", notif);
@@ -57,18 +117,24 @@ router.get("/contacts", protect, allowRoles("super_admin", "manager", "user"), a
   try {
     const { tag, managerId } = req.query;
     let filter = {};
-    if (req.user.role === "super_admin") { if (managerId) filter.createdBy = managerId; }
+    if (isTopAdmin(req.user.role)) { if (managerId) filter.createdBy = managerId; }
     else filter.status = "approved";
     if (tag) filter.tags = tag;
+    filter.role = { $nin: HIDDEN_CONTACT_ROLES };
+    filter = await mergeContactFilter(req, filter);
     const contacts = await Contact.find(filter).populate("tags").populate("createdBy", "name phone role");
-    res.json(req.user.role === "super_admin" ? await attachLoginUsers(contacts) : contacts);
+    const data = isTopAdmin(req.user.role) ? await attachLoginUsers(contacts) : contacts;
+    res.json(hideSystemContacts(data));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // GET ALL MANAGERS
 router.get("/contacts/managers", protect, allowRoles("super_admin"), async (req, res) => {
   try {
-    const managers = await User.find({ role: "manager" }).select("name phone role createdAt");
+    const query = req.user.role === "super_to_super_admin"
+      ? { role: "manager" }
+      : { role: "manager", organization: req.user.organization };
+    const managers = await User.find(query).select("name phone role createdAt organization");
     res.json(managers);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -76,8 +142,9 @@ router.get("/contacts/managers", protect, allowRoles("super_admin"), async (req,
 // GET PENDING CONTACTS
 router.get("/contacts/pending", protect, allowRoles("super_admin"), async (req, res) => {
   try {
-    const contacts = await Contact.find({ status: "pending" }).populate("tags").populate("createdBy", "name phone role");
-    res.json(await attachLoginUsers(contacts));
+    const filter = await mergeContactFilter(req, { status: "pending", role: { $nin: HIDDEN_CONTACT_ROLES } });
+    const contacts = await Contact.find(filter).populate("tags").populate("createdBy", "name phone role");
+    res.json(hideSystemContacts(await attachLoginUsers(contacts)));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -90,12 +157,15 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager"), async (r
     const existing = await Contact.findOne({ mobile });
     if (existing) return res.status(400).json({ error: "Contact already exists" });
 
-    const status = req.user.role === "super_admin" ? "approved" : "pending";
+    const status = isTopAdmin(req.user.role) ? "approved" : "pending";
 
     const contact = new Contact({
       name: name || "UNKNOWN", mobile, email: email || null,
       tags: tags || [], source: source || "MANUAL",
-      role: role || "user", status, createdBy: req.user.id,
+      role: role || "user",
+      status,
+      organization: req.user.organization,
+      createdBy: req.user.id,
     });
 
     await contact.save();
@@ -108,7 +178,16 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager"), async (r
         user.name = name || user.name; user.role = role || user.role;
         await user.save();
       } else {
-        await User.create({ name: name || "UNKNOWN", phone: mobile, email: email.toLowerCase(), password: hashedPassword, role: role || "user", createdBy: req.user.id });
+        await User.create({
+          name: name || "UNKNOWN",
+          phone: mobile,
+          email: email.toLowerCase(),
+          password: hashedPassword,
+          role: role || "user",
+          organization: req.user.organization,
+          allowedModules: req.user.allowedModules || [],
+          createdBy: req.user.id,
+        });
       }
     }
 
@@ -120,11 +199,12 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager"), async (r
         type: "contact_approval_requested",
         message: `${managerName} added a new contact pending approval: "${name || mobile}"`,
         contactId: contact._id,
+        organization: req.user.organization,
       });
     }
 
     const populated = await contact.populate("tags");
-    if (req.user.role === "super_admin") {
+    if (isTopAdmin(req.user.role)) {
       const [enriched] = await attachLoginUsers([populated]);
       return res.status(201).json(enriched);
     }
@@ -135,9 +215,17 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager"), async (r
 // APPROVE CONTACT
 router.put("/contacts/:id/approve", protect, allowRoles("super_admin"), async (req, res) => {
   try {
-    const contact = await Contact.findByIdAndUpdate(
-      req.params.id, { status: "approved" }, { new: true }
-    ).populate("tags").populate("createdBy", "name phone role");
+    const existing = await Contact.findById(req.params.id).populate("createdBy", "name phone role organization");
+    if (!existing) return res.status(404).json({ error: "Contact not found" });
+    if (!(await canAccessContact(req, existing))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
+
+    existing.status = "approved";
+    if (!existing.organization && req.user.organization) existing.organization = req.user.organization;
+    await existing.save();
+
+    const contact = await Contact.findById(existing._id).populate("tags").populate("createdBy", "name phone role organization");
 
     if (!contact) return res.status(404).json({ error: "Contact not found" });
 
@@ -158,9 +246,17 @@ router.put("/contacts/:id/approve", protect, allowRoles("super_admin"), async (r
 // REJECT CONTACT
 router.put("/contacts/:id/reject", protect, allowRoles("super_admin"), async (req, res) => {
   try {
-    const contact = await Contact.findByIdAndUpdate(
-      req.params.id, { status: "rejected" }, { new: true }
-    ).populate("tags").populate("createdBy", "name phone role");
+    const existing = await Contact.findById(req.params.id).populate("createdBy", "name phone role organization");
+    if (!existing) return res.status(404).json({ error: "Contact not found" });
+    if (!(await canAccessContact(req, existing))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
+
+    existing.status = "rejected";
+    if (!existing.organization && req.user.organization) existing.organization = req.user.organization;
+    await existing.save();
+
+    const contact = await Contact.findById(existing._id).populate("tags").populate("createdBy", "name phone role organization");
 
     if (!contact) return res.status(404).json({ error: "Contact not found" });
 
@@ -185,11 +281,14 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
     const contactId = req.params.id;
     const contact = await Contact.findById(contactId);
     if (!contact) return res.status(404).json({ error: "Contact not found" });
+    if (!(await canAccessContact(req, contact))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
     if (req.user.role === "manager" && contact.createdBy.toString() !== req.user.id)
       return res.status(403).json({ error: "Not authorized" });
 
     const wasApproved = contact.status === "approved";
-    if (req.user.role !== "super_admin") contact.status = "pending";
+    if (!isTopAdmin(req.user.role)) contact.status = "pending";
 
     if (mobile && mobile !== contact.mobile) {
       const existing = await Contact.findOne({ mobile, _id: { $ne: contactId } });
@@ -201,8 +300,9 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
     if (email    !== undefined) contact.email  = email || null;
     if (tags     !== undefined) contact.tags   = tags;
     if (source   !== undefined) contact.source = source;
+    if (!contact.organization && req.user.organization) contact.organization = req.user.organization;
     if (role !== undefined) {
-      if (req.user.role !== "super_admin") return res.status(403).json({ error: "Only super_admin can change roles" });
+      if (!isTopAdmin(req.user.role)) return res.status(403).json({ error: "Only admins can change roles" });
       contact.role = role;
     }
 
@@ -216,10 +316,11 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
         type: "contact_approval_requested",
         message: `${managerName} updated a contact pending re-approval: "${contact.name || contact.mobile}"`,
         contactId: contact._id,
+        organization: req.user.organization,
       });
     }
 
-    if (req.user.role === "super_admin" && (email || password)) {
+    if (isTopAdmin(req.user.role) && (email || password)) {
       const phoneLookup = mobile || contact.mobile;
       let user = await User.findOne({ phone: phoneLookup });
       if (user) {
@@ -229,12 +330,21 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
         if (role) user.role = role;
         await user.save();
       } else if (email && password) {
-        await User.create({ name: name || contact.name, phone: phoneLookup, email: email.toLowerCase(), password: await bcrypt.hash(password, 10), role: role || contact.role, createdBy: req.user.id });
+        await User.create({
+          name: name || contact.name,
+          phone: phoneLookup,
+          email: email.toLowerCase(),
+          password: await bcrypt.hash(password, 10),
+          role: role || contact.role,
+          organization: req.user.organization,
+          allowedModules: req.user.allowedModules || [],
+          createdBy: req.user.id,
+        });
       }
     }
 
     const populated = await contact.populate("tags");
-    if (req.user.role === "super_admin") {
+    if (isTopAdmin(req.user.role)) {
       const [enriched] = await attachLoginUsers([populated]);
       return res.json(enriched);
     }
@@ -247,8 +357,11 @@ router.patch("/contacts/:id/login-status", protect, allowRoles("super_admin"), a
   try {
     const contact = await Contact.findById(req.params.id)
       .populate("tags")
-      .populate("createdBy", "name phone role");
+      .populate("createdBy", "name phone role organization");
     if (!contact) return res.status(404).json({ error: "Contact not found" });
+    if (!(await canAccessContact(req, contact))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
 
     const lookup = [{ phone: contact.mobile }];
     if (contact.email) lookup.push({ email: String(contact.email).toLowerCase() });
@@ -274,8 +387,12 @@ router.patch("/contacts/:id/login-status", protect, allowRoles("super_admin"), a
 // DELETE CONTACT
 router.delete("/contacts/:id", protect, allowRoles("super_admin"), async (req, res) => {
   try {
-    const deleted = await Contact.findByIdAndDelete(req.params.id);
-    if (!deleted) return res.status(404).json({ error: "Contact not found" });
+    const contact = await Contact.findById(req.params.id);
+    if (!contact) return res.status(404).json({ error: "Contact not found" });
+    if (!(await canAccessContact(req, contact))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
+    await contact.deleteOne();
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });

@@ -7,6 +7,8 @@ const generateToken = (user) => {
       phone: user.phone,
       email: user.email,
       role: user.role,
+      organization: user.organization,
+      allowedModules: user.allowedModules || [],
       isActive: user.isActive !== false,
     },
     process.env.JWT_SECRET,

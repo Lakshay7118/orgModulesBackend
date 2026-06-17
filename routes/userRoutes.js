@@ -11,7 +11,7 @@ const SupportTicket = require("../models/SupportTicket");
 const generateToken = require("../utils/generateToken");
 const { getIO } = require("../sockets/socket");
 
-const PUBLIC_USER_FIELDS = "name phone email role isActive createdAt updatedAt";
+const PUBLIC_USER_FIELDS = "name phone email role organization allowedModules isActive createdAt updatedAt";
 
 const emitNotification = (phone, notification) => {
   try {
@@ -20,7 +20,7 @@ const emitNotification = (phone, notification) => {
 };
 
 const notifyAdmins = async (payload) => {
-  const admins = await User.find({ role: "super_admin" }).select("_id phone").lean();
+  const admins = await User.find({ role: { $in: ["super_to_super_admin", "super_admin"] } }).select("_id phone").lean();
   const notifications = await Promise.all(
     admins.map((admin) =>
       Notification.create({
@@ -36,7 +36,7 @@ const notifyAdmins = async (payload) => {
 };
 
 const notifySupportStaff = async (payload) => {
-  const staff = await User.find({ role: { $in: ["super_admin", "manager"] } }).select("_id phone").lean();
+  const staff = await User.find({ role: { $in: ["super_to_super_admin", "super_admin", "manager"] } }).select("_id phone").lean();
   const notifications = await Promise.all(
     staff.map((member) =>
       Notification.create({
@@ -104,6 +104,8 @@ router.post("/login", async (req, res) => {
         email: user.email,
         phone: user.phone,
         role: user.role,
+        organization: user.organization,
+        allowedModules: user.allowedModules || [],
         isActive: user.isActive !== false,
       },
     });
@@ -118,9 +120,12 @@ router.post("/login", async (req, res) => {
 // =======================
 // ✅ GET ALL USERS (for assignment dropdown)
 // =======================
-router.get("/", protect, allowRoles("super_admin", "manager"), async (req, res) => {
+router.get("/", protect, allowRoles("super_to_super_admin", "super_admin", "manager", "hr"), async (req, res) => {
   try {
-    const users = await User.find().select("name phone email role isActive").lean();
+    const query = req.user.role === "super_to_super_admin"
+      ? {}
+      : { organization: req.user.organization };
+    const users = await User.find(query).select("name phone email role organization allowedModules isActive").lean();
     res.json({ success: true, data: users });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -173,7 +178,7 @@ router.patch("/me", protect, async (req, res) => {
       if (existing) return res.status(400).json({ error: "Phone already in use" });
     }
 
-    if (user.role === "super_admin") {
+    if (["super_to_super_admin", "super_admin"].includes(user.role)) {
       changes.forEach((change) => {
         user[change.field] = change.field === "email" && change.to
           ? String(change.to).toLowerCase()
@@ -237,7 +242,7 @@ router.patch("/me/password", protect, async (req, res) => {
 // =======================
 router.get("/profile-change-requests", protect, async (req, res) => {
   try {
-    const query = req.user.role === "super_admin"
+    const query = ["super_to_super_admin", "super_admin"].includes(req.user.role)
       ? {}
       : { requester: req.user.id };
 
@@ -256,7 +261,7 @@ router.get("/profile-change-requests", protect, async (req, res) => {
 router.patch(
   "/profile-change-requests/:id",
   protect,
-  allowRoles("super_admin"),
+  allowRoles("super_to_super_admin", "super_admin"),
   async (req, res) => {
     try {
       const { status, note } = req.body;
@@ -352,7 +357,7 @@ router.post("/support-tickets", protect, async (req, res) => {
 
 router.get("/support-tickets", protect, async (req, res) => {
   try {
-    const canViewAll = ["super_admin", "manager"].includes(req.user.role);
+    const canViewAll = ["super_to_super_admin", "super_admin", "manager"].includes(req.user.role);
     const query = canViewAll ? {} : { user: req.user.id, status: { $ne: "ended" } };
     const tickets = await SupportTicket.find(query)
       .populate("user", "name phone email role")
@@ -369,7 +374,7 @@ router.get("/support-tickets", protect, async (req, res) => {
 router.post(
   "/support-tickets/:id/replies",
   protect,
-  allowRoles("super_admin", "manager"),
+  allowRoles("super_to_super_admin", "super_admin", "manager"),
   async (req, res) => {
     try {
       const { message, status } = req.body;
@@ -463,7 +468,7 @@ router.post("/support-tickets/:id/user-replies", protect, async (req, res) => {
 router.post(
   "/support-tickets/:id/reset-password",
   protect,
-  allowRoles("super_admin", "manager"),
+  allowRoles("super_to_super_admin", "super_admin", "manager"),
   async (req, res) => {
     try {
       const { temporaryPassword, reply } = req.body;
@@ -511,7 +516,7 @@ router.post(
 router.patch(
   "/support-tickets/:id/end",
   protect,
-  allowRoles("super_admin", "manager"),
+  allowRoles("super_to_super_admin", "super_admin", "manager"),
   async (req, res) => {
     try {
       const ticket = await SupportTicket.findById(req.params.id).populate("user", "name phone email role");
@@ -538,7 +543,7 @@ router.patch(
 router.delete(
   "/support-tickets/:id",
   protect,
-  allowRoles("super_admin", "manager"),
+  allowRoles("super_to_super_admin", "super_admin", "manager"),
   async (req, res) => {
     try {
       const ticket = await SupportTicket.findById(req.params.id);
@@ -562,30 +567,46 @@ router.delete(
 router.post(
   "/users/create",
   protect,
-  allowRoles("super_admin", "manager"),
+  allowRoles("super_to_super_admin", "super_admin", "manager", "hr"),
   async (req, res) => {
     try {
       const { name, phone, email, password, role } = req.body;
+      const targetRole = role || "user";
 
       if (!email) return res.status(400).json({ error: "Email required" });
       if (!password) return res.status(400).json({ error: "Password required" });
 
-      // manager can only create users, not managers or admins
-      if (req.user.role === "manager" && role !== "user") {
-        return res.status(403).json({ error: "Manager can only create users" });
+      const creatableRoles = {
+        super_to_super_admin: ["super_admin", "manager", "hr", "user"],
+        super_admin: ["manager", "hr", "user"],
+        manager: ["hr", "user"],
+        hr: ["user"],
+      };
+
+      if (!creatableRoles[req.user.role]?.includes(targetRole)) {
+        return res.status(403).json({ error: `${req.user.role} cannot create ${targetRole}` });
       }
 
       let user = await User.findOne({ email: email.toLowerCase() });
       if (user) return res.status(400).json({ error: "User already exists" });
+      if (phone) {
+        user = await User.findOne({ phone });
+        if (user) return res.status(400).json({ error: "Phone already exists" });
+      }
 
       const hashedPassword = await bcrypt.hash(password, 10);
+      const allowedModules = req.user.role === "super_to_super_admin"
+        ? req.body.allowedModules || []
+        : req.user.allowedModules || [];
 
       user = await User.create({
         name: name || "UNKNOWN",
         phone,
         email: email.toLowerCase(),
         password: hashedPassword,
-        role: role || "user",
+        role: targetRole,
+        organization: req.user.organization,
+        allowedModules,
         createdBy: req.user.id,
       });
 

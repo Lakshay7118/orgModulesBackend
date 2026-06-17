@@ -10,10 +10,13 @@ const allowRoles = require("../middleware/roleMiddleware");
 
 const router = express.Router();
 
+const TOP_ADMIN_ROLES = ["super_to_super_admin", "super_admin"];
+const isTopAdmin = (role) => TOP_ADMIN_ROLES.includes(role);
+
 // ── Shared helpers ───────────────────────────────────────────────
 async function notifyAdmins({ type, message, campaignId }) {
   const io = getIO();
-  const admins = await User.find({ role: "super_admin" }).select("_id").lean();
+  const admins = await User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
   for (const admin of admins) {
     const notif = await Notification.create({ userId: admin._id, type, message, campaignId });
     io.to(admin._id.toString()).emit("newNotification", notif);
@@ -170,7 +173,7 @@ router.post("/campaigns", protect, allowRoles("super_admin", "manager"), async (
       }
     }
 
-    const approvalStatus = req.user.role === "super_admin" ? "approved" : "pending_approval";
+    const approvalStatus = isTopAdmin(req.user.role) ? "approved" : "pending_approval";
 
     if (launchKeyValue) {
       const existingCampaign = await Campaign.findOne({
@@ -198,7 +201,7 @@ router.post("/campaigns", protect, allowRoles("super_admin", "manager"), async (
       recurrence: recurrence || { type: "one-time" },
       variableValues: finalVariableValues, messagePreview,
       createdBy: req.user.id,
-      status: req.user.role === "super_admin" ? "scheduled" : "draft",
+      status: isTopAdmin(req.user.role) ? "scheduled" : "draft",
       approvalStatus, nextRun,
     });
 

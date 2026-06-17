@@ -16,7 +16,7 @@ async function makeAdmin() {
       $set: {
         name,
         mobile: phone,
-        role: "super_admin",
+        role: "super_to_super_admin",
         status: "approved",
         createdBy: null,
       }
@@ -30,7 +30,8 @@ async function makeAdmin() {
       $set: {
         name,
         phone,
-        role: "super_admin",
+        role: "super_to_super_admin",
+        allowedModules: ["hr", "task", "chat"],
       }
     },
     { upsert: true } // ← KEY FIX

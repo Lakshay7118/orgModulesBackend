@@ -126,6 +126,10 @@ const HRStaffSchema = new mongoose.Schema(
       enum: ["active", "inactive", "resigned"],
       default: "active",
     },
+    organization: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization",
+    },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",

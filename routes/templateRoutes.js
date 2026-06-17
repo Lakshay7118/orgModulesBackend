@@ -11,6 +11,9 @@ const allowRoles = require("../middleware/roleMiddleware");
 
 const router = express.Router();
 
+const TOP_ADMIN_ROLES = ["super_to_super_admin", "super_admin"];
+const isTopAdmin = (role) => TOP_ADMIN_ROLES.includes(role);
+
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
@@ -36,7 +39,7 @@ const uploadToCloudinary = (buffer) => {
 // ── Shared helper: notify all admins ────────────────────────────
 async function notifyAdmins({ type, message, templateId }) {
   const io = getIO();
-  const admins = await User.find({ role: "super_admin" }).select("_id").lean();
+  const admins = await User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
   for (const admin of admins) {
     const notif = await Notification.create({
       userId: admin._id,
@@ -212,7 +215,7 @@ router.post(
         else if (mediaType === "Video") videoFile = { name: req.file.originalname, mimeType: req.file.mimetype, url: result.secure_url };
       }
 
-      const approvalStatus = req.user.role === "super_admin" ? "approved" : "pending_approval";
+      const approvalStatus = isTopAdmin(req.user.role) ? "approved" : "pending_approval";
 
       const template = new Template({
         name, category,

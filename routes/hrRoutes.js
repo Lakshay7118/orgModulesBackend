@@ -1,7 +1,9 @@
 const express = require("express");
 const mongoose = require("mongoose");
+const bcrypt = require("bcryptjs");
 const router = express.Router();
 
+const Contact = require("../models/Contact");
 const HRDepartment = require("../models/HRDepartment");
 const HRStaff = require("../models/HRStaff");
 const HRBank = require("../models/HRBank");
@@ -13,6 +15,7 @@ const HRPayrollSetting = require("../models/HRPayrollSetting");
 const User = require("../models/Users");
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
+const requireModule = require("../middleware/moduleMiddleware");
 
 
 router.use(protect);
@@ -93,6 +96,82 @@ const dateOnly = (date) => {
 const isObjectId = (value) => !value || mongoose.Types.ObjectId.isValid(value);
 const optionalString = (value) => (value === undefined || value === null ? "" : String(value).trim());
 const optionalUpperString = (value) => optionalString(value).toUpperCase();
+const sameId = (left, right) => left && right && String(left) === String(right);
+const cleanPhone = (value) => optionalString(value).replace(/\s/g, "");
+const organizationUserIds = async (organization) => {
+  if (!organization) return [];
+  const orgUsers = await User.find({ organization }).select("_id").lean();
+  return orgUsers.map((user) => user._id);
+};
+const orgStaffScope = async (req) => {
+  if (req.user.role === "super_to_super_admin") return {};
+  if (!req.user.organization) return { createdBy: req.user.id };
+  const orgUsers = await organizationUserIds(req.user.organization);
+  return {
+    $or: [
+      { organization: req.user.organization },
+      { organization: null, createdBy: { $in: orgUsers } },
+    ],
+  };
+};
+const mergeStaffScope = async (req, filter = {}) => {
+  const scope = await orgStaffScope(req);
+  return Object.keys(scope).length ? { $and: [scope, filter] } : filter;
+};
+const orgDepartmentScope = async (req) => {
+  if (req.user.role === "super_to_super_admin") return {};
+  if (!req.user.organization) return { createdBy: req.user.id };
+  const orgUsers = await organizationUserIds(req.user.organization);
+  return {
+    $or: [
+      { organization: req.user.organization },
+      { organization: null, createdBy: { $in: orgUsers } },
+    ],
+  };
+};
+const mergeDepartmentScope = async (req, filter = {}) => {
+  const scope = await orgDepartmentScope(req);
+  return Object.keys(scope).length ? { $and: [scope, filter] } : filter;
+};
+const canAccessDepartment = async (req, department) => {
+  if (!department) return false;
+  if (req.user.role === "super_to_super_admin") return true;
+  if (sameId(department.organization, req.user.organization)) return true;
+  if (!department.organization && department.createdBy) {
+    const creator = await User.findById(department.createdBy).select("organization").lean();
+    return sameId(creator?.organization, req.user.organization);
+  }
+  return false;
+};
+const ensureDepartmentAccess = async (req, departmentId) => {
+  if (!departmentId) return null;
+  if (!isObjectId(departmentId)) {
+    const error = new Error("Invalid department.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const department = await HRDepartment.findById(departmentId);
+  if (!department) {
+    const error = new Error("Department not found.");
+    error.statusCode = 404;
+    throw error;
+  }
+  if (!(await canAccessDepartment(req, department))) {
+    const error = new Error("Department belongs to another organization.");
+    error.statusCode = 403;
+    throw error;
+  }
+  return department;
+};
+const canAccessStaff = async (req, staff) => {
+  if (req.user.role === "super_to_super_admin") return true;
+  if (sameId(staff?.organization, req.user.organization)) return true;
+  if (!staff?.organization && staff?.createdBy) {
+    const creator = await User.findById(staff.createdBy).select("organization").lean();
+    return sameId(creator?.organization, req.user.organization);
+  }
+  return false;
+};
 const normalizeStaffAddress = (address = {}) => ({
   countryCode: optionalUpperString(address.countryCode),
   countryName: optionalString(address.countryName),
@@ -102,6 +181,10 @@ const normalizeStaffAddress = (address = {}) => ({
   houseAddress: optionalString(address.houseAddress),
 });
 const sendHrError = (res, error, fallback = "HR request failed") => {
+  if (error?.statusCode) {
+    return res.status(error.statusCode).json({ error: error.message || fallback });
+  }
+
   if (error?.code === 11000) {
     const field = Object.keys(error.keyPattern || error.keyValue || {})[0] || "field";
     const label = field === "employeeCode" ? "Employee code" : field;
@@ -645,7 +728,7 @@ async function createOrUpdateSalaryPaymentPayroll(staff, amount, userId, salaryM
   };
 }
 
-router.get("/me", allowRoles("super_admin", "manager", "user"), async (req, res) => {
+router.get("/me", allowRoles("super_admin", "manager", "hr", "user"), async (req, res) => {
   try {
     const staff = await findStaffForUser(req.user.id);
     if (!staff) {
@@ -658,6 +741,9 @@ router.get("/me", allowRoles("super_admin", "manager", "user"), async (req, res)
       || formatUTCDate(new Date()).slice(0, 7);
     const month = validMonth(req.query.month) ? req.query.month : latestSalaryMonth;
     const totalDays = daysInMonth(month);
+    const { year, monthIndex } = monthParts(month);
+    const monthStart = new Date(Date.UTC(year, monthIndex, 1));
+    const nextMonthStart = new Date(Date.UTC(year, monthIndex + 1, 1));
     const attendanceFilter = {
       staff: staff._id,
       date: {
@@ -666,13 +752,65 @@ router.get("/me", allowRoles("super_admin", "manager", "user"), async (req, res)
       },
     };
 
-    const [attendance, payrolls] = await Promise.all([
+    const [attendance, payrolls, storedTransactions] = await Promise.all([
       HRAttendance.find(attendanceFilter).sort({ date: -1, createdAt: -1 }),
       populatePayroll(HRPayroll.find({ staff: staff._id }).limit(120)),
+      HRBankTransaction.find({
+        staff: staff._id,
+        paidAt: { $gte: monthStart, $lt: nextMonthStart },
+      })
+        .populate("bank")
+        .populate("staff")
+        .populate("department")
+        .populate("loan")
+        .populate({ path: "payroll", populate: [{ path: "loanDeductions.loan" }] })
+        .populate("loanDeductions.loan")
+        .sort({ paidAt: -1, createdAt: -1 })
+        .lean(),
     ]);
     const visiblePayrolls = payrolls.filter((payroll) => (
       (payroll.periodStart || payroll.periodEnd || payroll.month || "").slice(0, 7) === month
     ));
+    const storedPaymentIds = new Set(
+      storedTransactions
+        .map((transaction) => transaction.paymentHistoryId?.toString())
+        .filter(Boolean)
+    );
+    const legacyTransactions = payrolls.flatMap((payroll) =>
+      (payroll.paymentHistory || [])
+        .map((payment, index) => ({ payment, index }))
+        .filter(({ payment }) => {
+          if (storedPaymentIds.has(payment._id?.toString())) return false;
+          const paidAt = payment.paidAt ? new Date(payment.paidAt) : null;
+          return paidAt && paidAt >= monthStart && paidAt < nextMonthStart;
+        })
+        .map(({ payment, index }) => {
+          const loanDeduction = index === 0 ? money(payroll.loanDeduction) : 0;
+          return {
+            _id: `${payroll._id}-${payment._id || payment.paidAt}`,
+            type: "salary",
+            direction: "out",
+            payroll,
+            staff,
+            department: payroll.department || staff.department,
+            bank: payment.bank,
+            amount: payment.amount || 0,
+            paidAt: payment.paidAt,
+            beneficiaryName: staff.name || "",
+            beneficiaryAccount: "",
+            note: payment.note || "",
+            payrollPeriodLabel: payroll.periodLabel || payroll.periodEnd || payroll.month,
+            grossSalary: money(payroll.grossSalary),
+            netPay: money(payroll.netPay),
+            loanDeduction,
+            loanDeductions: loanDeduction > 0 ? loanDeductionsSnapshot(payroll) : [],
+            status: payroll.status,
+          };
+        })
+    );
+    const bankTransactions = [...storedTransactions, ...legacyTransactions]
+      .map(attachSalaryTransactionDetails)
+      .sort((a, b) => new Date(b.paidAt || 0) - new Date(a.paidAt || 0));
 
     res.json({
       success: true,
@@ -681,6 +819,7 @@ router.get("/me", allowRoles("super_admin", "manager", "user"), async (req, res)
         month,
         attendance,
         payrolls: visiblePayrolls,
+        bankTransactions,
       },
     });
   } catch (error) {
@@ -688,13 +827,17 @@ router.get("/me", allowRoles("super_admin", "manager", "user"), async (req, res)
   }
 });
 
-router.use(allowRoles("super_admin", "manager"));
+router.use(requireModule("hr"), allowRoles("super_to_super_admin", "super_admin", "manager", "hr"));
 
 router.get("/summary", async (req, res) => {
   try {
+    const [departmentScope, activeStaffScope] = await Promise.all([
+      mergeDepartmentScope(req),
+      mergeStaffScope(req, { status: "active" }),
+    ]);
     const [departmentCount, activeStaffCount, banks, loans, unpaidPayrolls] = await Promise.all([
-      HRDepartment.countDocuments(),
-      HRStaff.countDocuments({ status: "active" }),
+      HRDepartment.countDocuments(departmentScope),
+      HRStaff.countDocuments(activeStaffScope),
       HRBank.find().lean(),
       HRLoan.find({ category: "advance", status: "active", outstanding: { $gt: 0 } }).lean(),
       HRPayroll.find({ status: { $in: ["draft", "partial"] } }).lean(),
@@ -747,7 +890,7 @@ router.patch("/payroll/settings", async (req, res) => {
 
 router.get("/departments", async (req, res) => {
   try {
-    const departments = await HRDepartment.find().sort({ name: 1 });
+    const departments = await HRDepartment.find(await mergeDepartmentScope(req)).sort({ name: 1 });
     res.json({ success: true, data: departments });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -768,15 +911,22 @@ router.post("/departments", async (req, res) => {
       },
       leavePolicy: normalizeLeavePolicy(req.body.leavePolicy),
       createdBy: req.user.id,
+      organization: req.user.organization || null,
     });
     res.status(201).json({ success: true, data: department });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendHrError(res, error, "Could not save department.");
   }
 });
 
 router.patch("/departments/:id", async (req, res) => {
   try {
+    const existing = await HRDepartment.findById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Department not found" });
+    if (!(await canAccessDepartment(req, existing))) {
+      return res.status(403).json({ error: "Department belongs to another organization." });
+    }
+
     const updates = {};
     ["name", "description"].forEach((field) => {
       if (req.body[field] !== undefined) updates[field] = req.body[field];
@@ -799,13 +949,19 @@ router.patch("/departments/:id", async (req, res) => {
     if (!department) return res.status(404).json({ error: "Department not found" });
     res.json({ success: true, data: department });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendHrError(res, error, "Could not update department.");
   }
 });
 
 router.delete("/departments/:id", async (req, res) => {
   try {
-    const staffCount = await HRStaff.countDocuments({ department: req.params.id });
+    const department = await HRDepartment.findById(req.params.id);
+    if (!department) return res.status(404).json({ error: "Department not found" });
+    if (!(await canAccessDepartment(req, department))) {
+      return res.status(403).json({ error: "Department belongs to another organization." });
+    }
+
+    const staffCount = await HRStaff.countDocuments(await mergeStaffScope(req, { department: req.params.id }));
     if (staffCount > 0) {
       return res.status(400).json({ error: "Move staff out of this department before deleting it" });
     }
@@ -820,10 +976,135 @@ router.get("/staff", async (req, res) => {
   try {
     const filter = {};
     if (req.query.status) filter.status = req.query.status;
-    const staff = await populateStaff(HRStaff.find(filter));
+    const staff = await populateStaff(HRStaff.find(await mergeStaffScope(req, filter)));
     res.json({ success: true, data: staff });
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+router.post("/contact-staff", async (req, res) => {
+  try {
+    const contactInput = req.body.contact || {};
+    const staffInput = req.body.staff || {};
+    const name = optionalString(contactInput.name || staffInput.name);
+    const mobile = cleanPhone(contactInput.mobile || staffInput.phone);
+    const email = optionalString(contactInput.email || staffInput.email).toLowerCase();
+    const password = contactInput.password || "";
+    const role = contactInput.role || "user";
+    const organization = req.user.organization || null;
+
+    if (!name) return res.status(400).json({ error: "Name is required." });
+    if (!mobile) return res.status(400).json({ error: "Mobile number is required." });
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Enter a valid email address." });
+    }
+
+    const existingContact = await Contact.findOne({ mobile });
+    if (existingContact?.organization && !sameId(existingContact.organization, organization)) {
+      return res.status(409).json({ error: "This mobile number already exists in another organization." });
+    }
+    if (existingContact && !existingContact.organization && existingContact.createdBy) {
+      const creator = await User.findById(existingContact.createdBy).select("organization").lean();
+      if (creator?.organization && !sameId(creator.organization, organization)) {
+        return res.status(409).json({ error: "This mobile number already exists in another organization." });
+      }
+    }
+
+    const existingStaffFilter = await mergeStaffScope(req, {
+      $or: [{ phone: mobile }, ...(email ? [{ email }] : [])],
+    });
+    const existingStaff = await HRStaff.findOne(existingStaffFilter);
+    if (existingStaff) {
+      return res.status(409).json({ error: "A staff profile already exists for this phone or email." });
+    }
+
+    let contact = existingContact;
+    if (contact) {
+      contact.name = name;
+      contact.email = email || contact.email || null;
+      contact.role = role;
+      contact.status = req.user.role === "manager" ? "pending" : "approved";
+      if (!contact.organization && organization) contact.organization = organization;
+      contact.createdBy = contact.createdBy || req.user.id;
+      await contact.save();
+    } else {
+      contact = await Contact.create({
+        name,
+        mobile,
+        email: email || null,
+        tags: contactInput.tags || [],
+        source: contactInput.source || "MANUAL",
+        role,
+        status: req.user.role === "manager" ? "pending" : "approved",
+        organization,
+        createdBy: req.user.id,
+      });
+    }
+
+    if (email && password) {
+      const hashedPassword = await bcrypt.hash(password, 10);
+      let user = await User.findOne({ $or: [{ phone: mobile }, { email }] });
+      if (user) {
+        if (user.organization && !sameId(user.organization, organization)) {
+          return res.status(409).json({ error: "Login account belongs to another organization." });
+        }
+        user.name = name;
+        user.phone = mobile;
+        user.email = email;
+        user.password = hashedPassword;
+        user.role = role;
+        if (!user.organization && organization) user.organization = organization;
+        if (!user.allowedModules?.length) user.allowedModules = req.user.allowedModules || [];
+        await user.save();
+      } else {
+        await User.create({
+          name,
+          phone: mobile,
+          email,
+          password: hashedPassword,
+          role,
+          organization,
+          allowedModules: req.user.allowedModules || [],
+          createdBy: req.user.id,
+        });
+      }
+    }
+
+    const department = staffInput.department || null;
+    if (department) await ensureDepartmentAccess(req, department);
+
+    const staff = await HRStaff.create({
+      employeeCode: String(staffInput.employeeCode || "").trim() || undefined,
+      name,
+      email: email || "",
+      phone: mobile,
+      address: normalizeStaffAddress(staffInput.address),
+      bankName: optionalString(staffInput.bankName),
+      accountHolderName: optionalString(staffInput.accountHolderName),
+      accountNumber: optionalString(staffInput.accountNumber),
+      ifscCode: optionalUpperString(staffInput.ifscCode),
+      branch: optionalString(staffInput.branch),
+      upiId: optionalString(staffInput.upiId),
+      department,
+      designation: staffInput.designation || "",
+      monthlySalary: money(staffInput.monthlySalary),
+      salaryBasis: normalizeSalaryBasis(staffInput.salaryBasis),
+      expectedHoursPerDay: toNumber(staffInput.expectedHoursPerDay, 8),
+      payrollCycleDay: normalizeCycleDay(
+        staffInput.payrollCycleDay,
+        cycleDayFromDate(staffInput.joinDate, 1)
+      ),
+      joinDate: staffInput.joinDate || Date.now(),
+      status: staffInput.status || "active",
+      organization,
+      createdBy: req.user.id,
+    });
+
+    await Promise.all([contact.populate("tags"), staff.populate("department")]);
+    res.status(201).json({ success: true, data: { contact, staff } });
+  } catch (error) {
+    sendHrError(res, error, "Could not onboard contact and staff.");
   }
 });
 
@@ -831,6 +1112,9 @@ router.get("/staff/:id", async (req, res) => {
   try {
     const staff = await populateStaff(HRStaff.findById(req.params.id));
     if (!staff) return res.status(404).json({ error: "Staff not found" });
+    if (!(await canAccessStaff(req, staff))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
     res.json({ success: true, data: staff });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -843,7 +1127,7 @@ router.post("/staff", async (req, res) => {
     const department = req.body.department || null;
 
     if (!name) return res.status(400).json({ error: "Staff name is required." });
-    if (!isObjectId(department)) return res.status(400).json({ error: "Invalid department." });
+    if (department) await ensureDepartmentAccess(req, department);
 
     const staff = await HRStaff.create({
       employeeCode: String(req.body.employeeCode || "").trim() || undefined,
@@ -868,6 +1152,7 @@ router.post("/staff", async (req, res) => {
       ),
       joinDate: req.body.joinDate || Date.now(),
       status: req.body.status || "active",
+      organization: req.user.organization,
       createdBy: req.user.id,
     });
     await staff.populate("department");
@@ -879,6 +1164,12 @@ router.post("/staff", async (req, res) => {
 
 router.patch("/staff/:id", async (req, res) => {
   try {
+    const existing = await HRStaff.findById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Staff not found" });
+    if (!(await canAccessStaff(req, existing))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
+
     const updates = {};
     [
       "employeeCode",
@@ -909,13 +1200,13 @@ router.patch("/staff/:id", async (req, res) => {
     if (updates.email) updates.email = updates.email.toLowerCase();
     if (updates.address !== undefined) updates.address = normalizeStaffAddress(updates.address);
     if (updates.ifscCode !== undefined) updates.ifscCode = optionalUpperString(updates.ifscCode);
-    if (updates.department !== undefined && !isObjectId(updates.department)) {
-      return res.status(400).json({ error: "Invalid department." });
-    }
+    if (updates.department) await ensureDepartmentAccess(req, updates.department);
     if (req.body.salaryBasis !== undefined) updates.salaryBasis = normalizeSalaryBasis(req.body.salaryBasis);
     if (req.body.payrollCycleDay !== undefined) updates.payrollCycleDay = normalizeCycleDay(req.body.payrollCycleDay);
     if (req.body.monthlySalary !== undefined) updates.monthlySalary = money(req.body.monthlySalary);
     if (req.body.expectedHoursPerDay !== undefined) updates.expectedHoursPerDay = toNumber(req.body.expectedHoursPerDay, 8);
+
+    if (!existing.organization && req.user.organization) updates.organization = req.user.organization;
 
     const staff = await HRStaff.findByIdAndUpdate(req.params.id, updates, {
       new: true,
@@ -932,6 +1223,9 @@ router.delete("/staff/:id", async (req, res) => {
   try {
     const staff = await HRStaff.findById(req.params.id);
     if (!staff) return res.status(404).json({ error: "Staff not found" });
+    if (!(await canAccessStaff(req, staff))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
 
     const [attendanceResult, payrollResult, loanResult] = await Promise.all([
       HRAttendance.deleteMany({ staff: staff._id }),
@@ -973,6 +1267,15 @@ router.get("/attendance", async (req, res) => {
     }
     if (req.query.staff) filter.staff = req.query.staff;
 
+    const staffScope = await mergeStaffScope(req, {});
+    if (Object.keys(staffScope).length) {
+      const visibleStaff = await HRStaff.find(staffScope).select("_id").lean();
+      const visibleIds = visibleStaff.map((staff) => staff._id);
+      filter.staff = filter.staff
+        ? { $in: visibleIds.filter((id) => sameId(id, req.query.staff)) }
+        : { $in: visibleIds };
+    }
+
     const attendance = await HRAttendance.find(filter)
       .populate({ path: "staff", populate: { path: "department" } })
       .sort({ date: -1, createdAt: -1 });
@@ -992,8 +1295,11 @@ router.post("/attendance", async (req, res) => {
       return res.status(400).json({ error: "Staff and valid attendance date are required." });
     }
 
-    const staff = await HRStaff.findById(req.body.staff).select("salaryBasis department").populate("department");
+    const staff = await HRStaff.findById(req.body.staff).select("salaryBasis department organization createdBy").populate("department");
     if (!staff) return res.status(404).json({ error: "Staff not found" });
+    if (!(await canAccessStaff(req, staff))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
 
     const checkIn = req.body.checkIn || "";
     const checkOut = req.body.checkOut || "";

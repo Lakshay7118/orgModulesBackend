@@ -18,7 +18,7 @@ const ContactSchema = new mongoose.Schema(
 
     role: {
       type: String,
-      enum: ["super_admin", "manager", "user"],
+      enum: ["super_to_super_admin", "super_admin", "manager", "hr", "user"],
       default: "user",
     },
 
@@ -26,6 +26,11 @@ const ContactSchema = new mongoose.Schema(
       type: String,
       enum: ["pending", "approved", "rejected"],
       default: "pending",
+    },
+
+    organization: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization",
     },
 
     createdBy: {

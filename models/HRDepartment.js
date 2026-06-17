@@ -6,7 +6,6 @@ const HRDepartmentSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
-      unique: true,
     },
     description: {
       type: String,
@@ -37,8 +36,23 @@ const HRDepartmentSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
     },
+    organization: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization",
+    },
   },
   { timestamps: true }
+);
+
+HRDepartmentSchema.index(
+  { organization: 1, name: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      organization: { $type: "objectId" },
+      name: { $type: "string" },
+    },
+  }
 );
 
 module.exports = mongoose.model("HRDepartment", HRDepartmentSchema);
