@@ -16,6 +16,24 @@ const sameId = (left, right) =>
 
 const isTopAdmin = (role) => TOP_ADMIN_ROLES.includes(role);
 
+const creatableRolesByRole = {
+  super_to_super_admin: ["super_admin", "manager", "hr", "user"],
+  super_admin: ["manager", "hr", "user"],
+  manager: ["hr", "user"],
+  hr: ["user"],
+};
+
+const resolveCreatableRole = (req, requestedRole) => {
+  const role = requestedRole || "user";
+  const allowedRoles = creatableRolesByRole[req.user.role] || [];
+  if (!allowedRoles.includes(role)) {
+    const error = new Error(`${req.user.role} cannot create ${role}`);
+    error.statusCode = 403;
+    throw error;
+  }
+  return role;
+};
+
 const getOrganizationContactScope = async (req) => {
   if (req.user.role === "super_to_super_admin") return {};
 
@@ -149,10 +167,11 @@ router.get("/contacts/pending", protect, allowRoles("super_admin"), async (req, 
 });
 
 // CREATE CONTACT
-router.post("/contacts", protect, allowRoles("super_admin", "manager"), async (req, res) => {
+router.post("/contacts", protect, allowRoles("super_admin", "manager", "hr"), async (req, res) => {
   try {
     const { name, mobile, email, password, tags, source, role } = req.body;
     if (!mobile) return res.status(400).json({ error: "Mobile number required" });
+    const targetRole = resolveCreatableRole(req, role);
 
     const existing = await Contact.findOne({ mobile });
     if (existing) return res.status(400).json({ error: "Contact already exists" });
@@ -162,7 +181,7 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager"), async (r
     const contact = new Contact({
       name: name || "UNKNOWN", mobile, email: email || null,
       tags: tags || [], source: source || "MANUAL",
-      role: role || "user",
+      role: targetRole,
       status,
       organization: req.user.organization,
       createdBy: req.user.id,
@@ -175,7 +194,7 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager"), async (r
       let user = await User.findOne({ phone: mobile });
       if (user) {
         user.email = email.toLowerCase(); user.password = hashedPassword;
-        user.name = name || user.name; user.role = role || user.role;
+        user.name = name || user.name; user.role = targetRole;
         await user.save();
       } else {
         await User.create({
@@ -183,7 +202,7 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager"), async (r
           phone: mobile,
           email: email.toLowerCase(),
           password: hashedPassword,
-          role: role || "user",
+          role: targetRole,
           organization: req.user.organization,
           allowedModules: req.user.allowedModules || [],
           createdBy: req.user.id,
@@ -349,7 +368,7 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
       return res.json(enriched);
     }
     res.json(populated);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message }); }
 });
 
 // UPDATE LOGIN ACCESS

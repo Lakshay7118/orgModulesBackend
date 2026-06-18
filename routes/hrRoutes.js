@@ -98,6 +98,22 @@ const optionalString = (value) => (value === undefined || value === null ? "" : 
 const optionalUpperString = (value) => optionalString(value).toUpperCase();
 const sameId = (left, right) => left && right && String(left) === String(right);
 const cleanPhone = (value) => optionalString(value).replace(/\s/g, "");
+const creatableRolesByRole = {
+  super_to_super_admin: ["super_admin", "manager", "hr", "user"],
+  super_admin: ["manager", "hr", "user"],
+  manager: ["hr", "user"],
+  hr: ["user"],
+};
+const resolveCreatableRole = (req, requestedRole) => {
+  const role = requestedRole || "user";
+  const allowedRoles = creatableRolesByRole[req.user.role] || [];
+  if (!allowedRoles.includes(role)) {
+    const error = new Error(`${req.user.role} cannot create ${role}`);
+    error.statusCode = 403;
+    throw error;
+  }
+  return role;
+};
 const organizationUserIds = async (organization) => {
   if (!organization) return [];
   const orgUsers = await User.find({ organization }).select("_id").lean();
@@ -991,7 +1007,7 @@ router.post("/contact-staff", async (req, res) => {
     const mobile = cleanPhone(contactInput.mobile || staffInput.phone);
     const email = optionalString(contactInput.email || staffInput.email).toLowerCase();
     const password = contactInput.password || "";
-    const role = contactInput.role || "user";
+    const role = resolveCreatableRole(req, contactInput.role);
     const organization = req.user.organization || null;
 
     if (!name) return res.status(400).json({ error: "Name is required." });
@@ -1640,7 +1656,7 @@ router.post("/banks/:id/payment", async (req, res) => {
       { path: "payroll", populate: [{ path: "loanDeductions.loan" }] },
     ]);
     if (loan) await loan.populate({ path: "staff", populate: { path: "department" } });
-    const recalculatedPayrolls = loan && direction === "out"
+    const recalculatedPayrolls = loan
       ? await recalculateUnsettledPayrollsForStaff(staff._id, req.user.id)
       : [];
     const paidPayrolls = payroll
