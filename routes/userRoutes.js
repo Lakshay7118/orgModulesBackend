@@ -4,6 +4,7 @@ const bcrypt = require("bcryptjs");
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 const User = require("../models/Users");
+const Organization = require("../models/Organization");
 const Contact = require("../models/Contact");
 const Notification = require("../models/Notification");
 const ProfileChangeRequest = require("../models/ProfileChangeRequest");
@@ -82,6 +83,16 @@ router.post("/login", async (req, res) => {
 
     if (user.isActive === false) {
       return res.status(403).json({ error: "Your account is inactive. Please contact admin." });
+    }
+
+    if (user.role !== "super_to_super_admin" && user.organization) {
+      const organization = await Organization.findById(user.organization).select("isActive").lean();
+      if (organization?.isActive === false) {
+        return res.status(403).json({
+          code: "ORGANIZATION_INACTIVE",
+          error: "Service no longer available for this organization.",
+        });
+      }
     }
 
     // Check password

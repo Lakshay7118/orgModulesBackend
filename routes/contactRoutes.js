@@ -131,7 +131,7 @@ async function notifyUser({ userId, type, message, contactId }) {
 }
 
 // GET ALL CONTACTS
-router.get("/contacts", protect, allowRoles("super_admin", "manager", "user"), async (req, res) => {
+router.get("/contacts", protect, allowRoles("super_admin", "manager", "hr", "user"), async (req, res) => {
   try {
     const { tag, managerId } = req.query;
     let filter = {};

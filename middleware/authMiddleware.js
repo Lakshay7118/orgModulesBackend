@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/Users");
+const Organization = require("../models/Organization");
 
 const protect = async (req, res, next) => {
   try {
@@ -17,6 +18,17 @@ const protect = async (req, res, next) => {
 
       if (user.isActive === false) {
         return res.status(403).json({ message: "Account inactive. Contact admin." });
+      }
+
+      if (user.role !== "super_to_super_admin" && user.organization) {
+        const organization = await Organization.findById(user.organization).select("isActive").lean();
+        if (organization?.isActive === false) {
+          return res.status(403).json({
+            code: "ORGANIZATION_INACTIVE",
+            message: "Service no longer available for this organization.",
+            error: "Service no longer available for this organization.",
+          });
+        }
       }
 
       req.user = {

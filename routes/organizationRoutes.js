@@ -7,6 +7,7 @@ const User = require("../models/Users");
 const Contact = require("../models/Contact");
 const HRDepartment = require("../models/HRDepartment");
 const HRStaff = require("../models/HRStaff");
+const generateToken = require("../utils/generateToken");
 
 const router = express.Router();
 
@@ -139,6 +140,81 @@ router.put("/:id", protect, allowRoles("super_to_super_admin"), async (req, res)
 
     const updatedOrganization = await populateOrganization(Organization.findById(organization._id));
     res.json({ success: true, data: updatedOrganization });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.patch("/:id/super-admin/email", protect, allowRoles("super_to_super_admin"), async (req, res) => {
+  try {
+    const email = String(req.body.email || "").trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: "Email is required" });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: "Enter a valid email address" });
+    }
+
+    const organization = await Organization.findById(req.params.id);
+    if (!organization) return res.status(404).json({ error: "Organization not found" });
+    if (!organization.superAdmin) return res.status(404).json({ error: "Super admin not found" });
+
+    const existingEmail = await User.findOne({ email, _id: { $ne: organization.superAdmin } });
+    if (existingEmail) return res.status(400).json({ error: "Email already exists" });
+
+    await User.findByIdAndUpdate(organization.superAdmin, { email }, { runValidators: true });
+
+    const updatedOrganization = await populateOrganization(Organization.findById(organization._id));
+    res.json({ success: true, data: updatedOrganization });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.patch("/:id/super-admin/password", protect, allowRoles("super_to_super_admin"), async (req, res) => {
+  try {
+    const password = String(req.body.password || "");
+    if (password.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters" });
+    }
+
+    const organization = await Organization.findById(req.params.id);
+    if (!organization) return res.status(404).json({ error: "Organization not found" });
+    if (!organization.superAdmin) return res.status(404).json({ error: "Super admin not found" });
+
+    await User.findByIdAndUpdate(organization.superAdmin, {
+      password: await bcrypt.hash(password, 10),
+    });
+
+    res.json({ success: true, message: "Password updated" });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post("/:id/login-as", protect, allowRoles("super_to_super_admin"), async (req, res) => {
+  try {
+    const organization = await Organization.findById(req.params.id).populate("superAdmin");
+    if (!organization) return res.status(404).json({ error: "Organization not found" });
+    const superAdmin = organization.superAdmin;
+    if (!superAdmin) return res.status(404).json({ error: "Super admin not found" });
+    if (superAdmin.isActive === false || organization.isActive === false) {
+      return res.status(403).json({ error: "Organization or super admin is inactive" });
+    }
+
+    const token = generateToken(superAdmin);
+    res.json({
+      success: true,
+      token,
+      user: {
+        id: superAdmin._id,
+        name: superAdmin.name,
+        email: superAdmin.email,
+        phone: superAdmin.phone,
+        role: superAdmin.role,
+        organization: superAdmin.organization,
+        allowedModules: superAdmin.allowedModules || [],
+        isActive: superAdmin.isActive !== false,
+      },
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
