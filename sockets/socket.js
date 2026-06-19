@@ -1,7 +1,9 @@
 // sockets/socket.js
 const { Server } = require("socket.io");
+const jwt = require("jsonwebtoken");
 const Chat = require("../models/chat");
 const Message = require("../models/Message");
+const User = require("../models/Users");
 const { buildMessagePreview, updateChatLastMessage } = require("../utils/chatPreview");
 
 let io;
@@ -23,6 +25,35 @@ const normalizePresenceKey = (phone) => {
   const digits = raw.replace(/\D/g, "");
   if (!digits) return raw;
   return digits.length > 10 ? digits.slice(-10) : digits;
+};
+
+const hasChatAccess = (user) => {
+  if (user?.role === "super_to_super_admin") return true;
+  return Array.isArray(user?.allowedModules) && user.allowedModules.includes("chat");
+};
+
+const loadSocketUser = async (socket) => {
+  const token = socket.handshake?.auth?.token;
+  if (!token) return null;
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id)
+      .select("name phone role allowedModules isActive")
+      .lean();
+
+    if (!user || user.isActive === false) return null;
+
+    return {
+      id: user._id.toString(),
+      name: user.name,
+      phone: user.phone,
+      role: user.role,
+      allowedModules: user.allowedModules || [],
+    };
+  } catch {
+    return null;
+  }
 };
 
 const removePresenceSocket = (presenceKey, socketId) => {
@@ -96,12 +127,21 @@ const initSocket = (server) => {
     pingInterval: 10000,
   });
 
-  io.on("connection", (socket) => {
+  io.on("connection", async (socket) => {
+    socket.user = await loadSocketUser(socket);
+    socket.hasChatAccess = hasChatAccess(socket.user);
     console.log("User connected:", socket.id);
 
     // ================= CHAT ROOM =================
-    socket.on("joinChat", (chatId) => {
-      socket.join(chatId);
+    socket.on("joinChat", async (chatId) => {
+      if (!socket.hasChatAccess || !chatId) return;
+
+      const chat = await Chat.findById(chatId).select("participants").lean();
+      const userPhone = String(socket.user?.phone || "");
+      const isParticipant = chat?.participants?.some((phone) => String(phone) === userPhone);
+      const isAdmin = ["super_admin", "manager"].includes(socket.user?.role);
+
+      if (chat && (isParticipant || isAdmin)) socket.join(chatId);
     });
 
     socket.on("joinUserIdRoom", (userId) => {
@@ -168,15 +208,18 @@ const initSocket = (server) => {
 
     // ================= OTHER EVENTS =================
     socket.on("typing", ({ chatId, user }) => {
+      if (!socket.hasChatAccess) return;
       socket.to(chatId).emit("userTyping", { chatId, user });
     });
 
     socket.on("markRead", ({ chatId }) => {
+      if (!socket.hasChatAccess) return;
       socket.to(chatId).emit("messagesSeen", { chatId });
     });
 
     // ================= CALL SIGNALING =================
     socket.on("call:offer", ({ to, from, fromName, callId, chatId, offer, callType }) => {
+      if (!socket.hasChatAccess) return;
       if (!to || !from || !offer) return;
 
       console.log("[call:offer]", {
@@ -198,6 +241,7 @@ const initSocket = (server) => {
     });
 
     socket.on("call:answer", ({ to, from, callId, chatId, answer }) => {
+      if (!socket.hasChatAccess) return;
       if (!to || !from || !answer) return;
 
       console.log("[call:answer]", {
@@ -224,6 +268,7 @@ const initSocket = (server) => {
     });
 
     socket.on("call:ice-candidate", ({ to, from, callId, chatId, candidate }) => {
+      if (!socket.hasChatAccess) return;
       if (!to || !from || !candidate) return;
 
       console.log("[call:ice-candidate]", {
@@ -245,6 +290,7 @@ const initSocket = (server) => {
     });
 
     socket.on("call:reject", async ({ to, from, callId, chatId, reason, callType }) => {
+      if (!socket.hasChatAccess) return;
       if (!to || !from) return;
 
       io.to(getPhoneRooms(to)).emit("call:rejected", {
@@ -275,6 +321,7 @@ const initSocket = (server) => {
     });
 
     socket.on("call:busy", async ({ to, from, callId, chatId, callType }) => {
+      if (!socket.hasChatAccess) return;
       if (!to || !from) return;
 
       io.to(getPhoneRooms(to)).emit("call:busy", {
@@ -297,6 +344,7 @@ const initSocket = (server) => {
     });
 
     socket.on("call:end", async ({ to, from, callId, chatId, reason, initiator, durationSeconds, wasConnected, callType }) => {
+      if (!socket.hasChatAccess) return;
       if (!to || !from) return;
 
       io.to(getPhoneRooms(to)).emit("call:ended", {
@@ -332,18 +380,22 @@ const initSocket = (server) => {
     });
 
     socket.on("chatDeleted", ({ chatId, userPhone }) => {
+      if (!socket.hasChatAccess) return;
       io.to(userPhone).emit("chatDeleted", { chatId, userPhone });
     });
 
     socket.on("chatDeletedPermanently", ({ chatId }) => {
+      if (!socket.hasChatAccess) return;
       io.to(chatId).emit("chatDeletedPermanently", { chatId });
     });
 
     socket.on("pinChat", ({ chatId, userPhone, pinned }) => {
+      if (!socket.hasChatAccess) return;
       io.to(userPhone).emit("chatPinned", { chatId, pinned });
     });
 
     socket.on("clearChat", ({ chatId, userPhone }) => {
+      if (!socket.hasChatAccess) return;
       io.to(userPhone).emit("chatCleared", { chatId });
     });
   });
