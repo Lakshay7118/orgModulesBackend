@@ -36,8 +36,66 @@ const notifyAdmins = async (payload) => {
   return notifications;
 };
 
-const notifySupportStaff = async (payload) => {
-  const staff = await User.find({ role: { $in: ["super_to_super_admin", "super_admin", "manager"] } }).select("_id phone").lean();
+const sameId = (left, right) => left && right && String(left) === String(right);
+
+const organizationUserIds = async (organization) => {
+  if (!organization) return [];
+  const users = await User.find({ organization }).select("_id").lean();
+  return users.map((user) => user._id);
+};
+
+const getSupportTicketScope = async (req) => {
+  if (req.user.role === "super_to_super_admin") {
+    const superAdmins = await User.find({ role: "super_admin" }).select("_id").lean();
+    return { user: { $in: superAdmins.map((user) => user._id) } };
+  }
+
+  if (["super_admin", "manager"].includes(req.user.role)) {
+    if (!req.user.organization) return { user: req.user.id };
+    const orgUsers = await organizationUserIds(req.user.organization);
+    return {
+      $or: [
+        { organization: req.user.organization },
+        { organization: null, user: { $in: orgUsers } },
+      ],
+    };
+  }
+
+  return { user: req.user.id, status: { $ne: "ended" } };
+};
+
+const canAccessSupportTicket = async (req, ticket) => {
+  if (!ticket) return false;
+
+  const ticketUserId = ticket.user?._id || ticket.user;
+  if (sameId(ticketUserId, req.user.id)) return true;
+
+  if (req.user.role === "super_to_super_admin") {
+    const requesterRole = ticket.user?.role || (await User.findById(ticketUserId).select("role").lean())?.role;
+    return requesterRole === "super_admin";
+  }
+
+  if (!["super_admin", "manager"].includes(req.user.role)) return false;
+  if (sameId(ticket.organization, req.user.organization)) return true;
+
+  if (!ticket.organization && ticketUserId) {
+    const requester = await User.findById(ticketUserId).select("organization").lean();
+    return sameId(requester?.organization, req.user.organization);
+  }
+
+  return false;
+};
+
+const notifySupportStaff = async (payload, { organization, requesterRole } = {}) => {
+  const roleQuery = requesterRole === "super_admin"
+    ? ["super_to_super_admin"]
+    : ["super_admin", "manager"];
+
+  const query = requesterRole === "super_admin"
+    ? { role: { $in: roleQuery } }
+    : { role: { $in: roleQuery }, organization };
+
+  const staff = await User.find(query).select("_id phone").lean();
   const notifications = await Promise.all(
     staff.map((member) =>
       Notification.create({
@@ -348,16 +406,20 @@ router.post("/support-tickets", protect, async (req, res) => {
 
     const ticket = await SupportTicket.create({
       user: req.user.id,
+      organization: req.user.organization || null,
       category,
       subject,
       message,
       priority: priority || "medium",
     });
 
-    const requester = await User.findById(req.user.id).select("name phone").lean();
+    const requester = await User.findById(req.user.id).select("name phone role organization").lean();
     await notifySupportStaff({
       type: "support_ticket_created",
       message: `${requester?.name || requester?.phone || "A user"} raised a support ticket: ${subject}`,
+    }, {
+      organization: requester?.organization || req.user.organization,
+      requesterRole: requester?.role || req.user.role,
     });
 
     res.status(201).json({ success: true, data: ticket });
@@ -368,10 +430,9 @@ router.post("/support-tickets", protect, async (req, res) => {
 
 router.get("/support-tickets", protect, async (req, res) => {
   try {
-    const canViewAll = ["super_to_super_admin", "super_admin", "manager"].includes(req.user.role);
-    const query = canViewAll ? {} : { user: req.user.id, status: { $ne: "ended" } };
+    const query = await getSupportTicketScope(req);
     const tickets = await SupportTicket.find(query)
-      .populate("user", "name phone email role")
+      .populate("user", "name phone email role organization")
       .populate("replies.sender", "name phone email role")
       .populate("endedBy", "name phone email role")
       .sort({ createdAt: -1 })
@@ -391,8 +452,11 @@ router.post(
       const { message, status } = req.body;
       if (!message) return res.status(400).json({ error: "Reply message is required" });
 
-      const ticket = await SupportTicket.findById(req.params.id).populate("user", "name phone email role");
+      const ticket = await SupportTicket.findById(req.params.id).populate("user", "name phone email role organization");
       if (!ticket) return res.status(404).json({ error: "Ticket not found" });
+      if (!(await canAccessSupportTicket(req, ticket))) {
+        return res.status(403).json({ error: "Not authorized for this ticket" });
+      }
       if (ticket.status === "ended") {
         return res.status(400).json({ error: "This chat has ended" });
       }
@@ -423,7 +487,7 @@ router.post(
       if (ticket.user.phone) emitNotification(ticket.user.phone, notification);
 
       const data = await SupportTicket.findById(ticket._id)
-        .populate("user", "name phone email role")
+        .populate("user", "name phone email role organization")
         .populate("replies.sender", "name phone email role")
         .populate("endedBy", "name phone email role")
         .lean();
@@ -440,7 +504,7 @@ router.post("/support-tickets/:id/user-replies", protect, async (req, res) => {
     const { message } = req.body;
     if (!message) return res.status(400).json({ error: "Reply message is required" });
 
-    const ticket = await SupportTicket.findById(req.params.id).populate("user", "name phone email role");
+    const ticket = await SupportTicket.findById(req.params.id).populate("user", "name phone email role organization");
     if (!ticket) return res.status(404).json({ error: "Ticket not found" });
     if (ticket.user._id.toString() !== req.user.id) {
       return res.status(403).json({ error: "Not authorized for this ticket" });
@@ -458,14 +522,17 @@ router.post("/support-tickets/:id/user-replies", protect, async (req, res) => {
     if (ticket.status === "open") ticket.status = "in_progress";
     await ticket.save();
 
-    const requester = await User.findById(req.user.id).select("name phone").lean();
+    const requester = await User.findById(req.user.id).select("name phone role organization").lean();
     await notifySupportStaff({
       type: "support_ticket_created",
       message: `${requester?.name || requester?.phone || "A user"} replied to support ticket: ${ticket.subject}`,
+    }, {
+      organization: requester?.organization || req.user.organization,
+      requesterRole: requester?.role || req.user.role,
     });
 
     const data = await SupportTicket.findById(ticket._id)
-      .populate("user", "name phone email role")
+      .populate("user", "name phone email role organization")
       .populate("replies.sender", "name phone email role")
       .populate("endedBy", "name phone email role")
       .lean();
@@ -487,8 +554,11 @@ router.post(
         return res.status(400).json({ error: "Temporary password must be at least 6 characters" });
       }
 
-      const ticket = await SupportTicket.findById(req.params.id).populate("user", "name phone email role password");
+      const ticket = await SupportTicket.findById(req.params.id).populate("user", "name phone email role organization password");
       if (!ticket) return res.status(404).json({ error: "Ticket not found" });
+      if (!(await canAccessSupportTicket(req, ticket))) {
+        return res.status(403).json({ error: "Not authorized for this ticket" });
+      }
       if (ticket.status === "ended") {
         return res.status(400).json({ error: "This chat has ended" });
       }
@@ -512,7 +582,7 @@ router.post(
       if (ticket.user.phone) emitNotification(ticket.user.phone, notification);
 
       const data = await SupportTicket.findById(ticket._id)
-        .populate("user", "name phone email role")
+        .populate("user", "name phone email role organization")
         .populate("replies.sender", "name phone email role")
         .populate("endedBy", "name phone email role")
         .lean();
@@ -530,8 +600,11 @@ router.patch(
   allowRoles("super_to_super_admin", "super_admin", "manager"),
   async (req, res) => {
     try {
-      const ticket = await SupportTicket.findById(req.params.id).populate("user", "name phone email role");
+      const ticket = await SupportTicket.findById(req.params.id).populate("user", "name phone email role organization");
       if (!ticket) return res.status(404).json({ error: "Ticket not found" });
+      if (!(await canAccessSupportTicket(req, ticket))) {
+        return res.status(403).json({ error: "Not authorized for this ticket" });
+      }
 
       ticket.status = "ended";
       ticket.endedAt = new Date();
@@ -539,7 +612,7 @@ router.patch(
       await ticket.save();
 
       const data = await SupportTicket.findById(ticket._id)
-        .populate("user", "name phone email role")
+        .populate("user", "name phone email role organization")
         .populate("replies.sender", "name phone email role")
         .populate("endedBy", "name phone email role")
         .lean();
@@ -559,6 +632,9 @@ router.delete(
     try {
       const ticket = await SupportTicket.findById(req.params.id);
       if (!ticket) return res.status(404).json({ error: "Ticket not found" });
+      if (!(await canAccessSupportTicket(req, ticket))) {
+        return res.status(403).json({ error: "Not authorized for this ticket" });
+      }
       if (ticket.status !== "ended") {
         return res.status(400).json({ error: "Only ended tickets can be deleted" });
       }

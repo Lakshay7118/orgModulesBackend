@@ -3,6 +3,11 @@ const mongoose = require("mongoose");
 const SupportTicketSchema = new mongoose.Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    organization: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization",
+      default: null,
+    },
     category: { type: String, required: true },
     subject: { type: String, required: true },
     message: { type: String, required: true },
@@ -29,5 +34,8 @@ const SupportTicketSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+SupportTicketSchema.index({ organization: 1, createdAt: -1 });
+SupportTicketSchema.index({ user: 1, status: 1 });
 
 module.exports = mongoose.model("SupportTicket", SupportTicketSchema);

@@ -12,11 +12,70 @@ const router = express.Router();
 
 const TOP_ADMIN_ROLES = ["super_to_super_admin", "super_admin"];
 const isTopAdmin = (role) => TOP_ADMIN_ROLES.includes(role);
+const sameId = (left, right) => left && right && String(left) === String(right);
+
+const organizationUserIds = async (organization) => {
+  if (!organization) return [];
+  const users = await User.find({ organization }).select("_id").lean();
+  return users.map((user) => user._id);
+};
+
+const scopedCampaignFilter = async (req, filter = {}) => {
+  if (req.user.role === "super_to_super_admin") return filter;
+
+  if (!req.user.organization) {
+    return { $and: [{ createdBy: req.user.id }, filter] };
+  }
+
+  const orgUsers = await organizationUserIds(req.user.organization);
+  return {
+    $and: [
+      {
+        $or: [
+          { organization: req.user.organization },
+          { organization: null, createdBy: { $in: orgUsers } },
+        ],
+      },
+      filter,
+    ],
+  };
+};
+
+const canAccessCampaign = async (req, campaign) => {
+  if (req.user.role === "super_to_super_admin") return true;
+  if (!campaign) return false;
+  if (sameId(campaign.organization, req.user.organization)) return true;
+  if (!campaign.organization && campaign.createdBy) {
+    const creatorId = campaign.createdBy._id || campaign.createdBy;
+    const creator = await User.findById(creatorId).select("organization").lean();
+    return sameId(creator?.organization, req.user.organization);
+  }
+  return false;
+};
+
+const canAccessTemplate = async (req, template) => {
+  if (req.user.role === "super_to_super_admin") return true;
+  if (!template) return false;
+  if (sameId(template.organization, req.user.organization)) return true;
+  if (!template.organization && template.createdBy) {
+    const creator = await User.findById(template.createdBy).select("organization").lean();
+    return sameId(creator?.organization, req.user.organization);
+  }
+  return false;
+};
 
 // ── Shared helpers ───────────────────────────────────────────────
-async function notifyAdmins({ type, message, campaignId }) {
+async function notifyAdmins({ type, message, campaignId, organization }) {
   const io = getIO();
-  const admins = await User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
+  const query = organization
+    ? {
+        $or: [
+          { role: "super_to_super_admin" },
+          { role: "super_admin", organization },
+        ],
+      }
+    : { role: { $in: TOP_ADMIN_ROLES } };
+  const admins = await User.find(query).select("_id").lean();
   for (const admin of admins) {
     const notif = await Notification.create({ userId: admin._id, type, message, campaignId });
     io.to(admin._id.toString()).emit("newNotification", notif);
@@ -56,7 +115,8 @@ function computeNextRun(recurrence, baseDate = new Date()) {
 // GET PENDING APPROVALS
 router.get("/campaigns/pending", protect, allowRoles("super_admin"), async (req, res) => {
   try {
-    const campaigns = await Campaign.find({ approvalStatus: "pending_approval" })
+    const filter = await scopedCampaignFilter(req, { approvalStatus: "pending_approval" });
+    const campaigns = await Campaign.find(filter)
       .populate("createdBy", "name phone role")
       .populate("templateId", "name")
       .sort({ createdAt: -1 });
@@ -67,13 +127,17 @@ router.get("/campaigns/pending", protect, allowRoles("super_admin"), async (req,
 // APPROVE CAMPAIGN
 router.put("/campaigns/:id/approve", protect, allowRoles("super_admin"), async (req, res) => {
   try {
+    const existing = await Campaign.findById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Campaign not found" });
+    if (!(await canAccessCampaign(req, existing))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
+
     const campaign = await Campaign.findByIdAndUpdate(
       req.params.id,
-      { approvalStatus: "approved", status: "scheduled" },
+      { approvalStatus: "approved", status: "scheduled", organization: existing.organization || req.user.organization || null },
       { new: true }
     ).populate("createdBy", "name phone role");
-
-    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
 
     // ✅ Notify manager
     await notifyUser({
@@ -90,13 +154,17 @@ router.put("/campaigns/:id/approve", protect, allowRoles("super_admin"), async (
 // REJECT CAMPAIGN
 router.put("/campaigns/:id/reject", protect, allowRoles("super_admin"), async (req, res) => {
   try {
+    const existing = await Campaign.findById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Campaign not found" });
+    if (!(await canAccessCampaign(req, existing))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
+
     const campaign = await Campaign.findByIdAndUpdate(
       req.params.id,
-      { approvalStatus: "rejected", status: "cancelled" },
+      { approvalStatus: "rejected", status: "cancelled", organization: existing.organization || req.user.organization || null },
       { new: true }
     ).populate("createdBy", "name phone role");
-
-    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
 
     // ✅ Notify manager
     await notifyUser({
@@ -115,6 +183,7 @@ router.get("/campaigns", protect, allowRoles("super_admin", "manager", "user"), 
   try {
     let filter = {};
     if (req.user.role === "manager") filter.createdBy = req.user.id;
+    filter = await scopedCampaignFilter(req, filter);
     const campaigns = await Campaign.find(filter)
       .populate("createdBy", "name phone role")
       .populate("templateId", "name")
@@ -130,6 +199,9 @@ router.get("/campaigns/:id", protect, allowRoles("super_admin", "manager", "user
       .populate("createdBy", "name phone role")
       .populate("templateId", "name");
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    if (!(await canAccessCampaign(req, campaign))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
     if (req.user.role === "manager" && campaign.createdBy._id.toString() !== req.user.id)
       return res.status(403).json({ error: "Not authorized" });
     res.json({ success: true, campaign });
@@ -165,6 +237,9 @@ router.post("/campaigns", protect, allowRoles("super_admin", "manager"), async (
     if (templateId) {
       const Template = require("../models/Template");
       const template = await Template.findById(templateId).lean();
+      if (!template || !(await canAccessTemplate(req, template))) {
+        return res.status(403).json({ error: "Template belongs to another organization" });
+      }
       if (template?.variables) {
         for (const [key, varDef] of Object.entries(template.variables)) {
           if (!finalVariableValues[key]) finalVariableValues[key] = { type: varDef.type, value: varDef.value || "" };
@@ -201,6 +276,7 @@ router.post("/campaigns", protect, allowRoles("super_admin", "manager"), async (
       recurrence: recurrence || { type: "one-time" },
       variableValues: finalVariableValues, messagePreview,
       createdBy: req.user.id,
+      organization: req.user.organization || null,
       status: isTopAdmin(req.user.role) ? "scheduled" : "draft",
       approvalStatus, nextRun,
     });
@@ -215,6 +291,7 @@ router.post("/campaigns", protect, allowRoles("super_admin", "manager"), async (
         type: "campaign_approval_requested",
         message: `${managerName} submitted a campaign for approval: "${campaign.campaignName}"`,
         campaignId: campaign._id,
+        organization: req.user.organization,
       });
     }
 
@@ -236,6 +313,9 @@ router.put("/campaigns/:id", protect, allowRoles("super_admin", "manager"), asyn
     const campaignId = req.params.id;
     const existing = await Campaign.findById(campaignId);
     if (!existing) return res.status(404).json({ error: "Campaign not found" });
+    if (!(await canAccessCampaign(req, existing))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
     if (req.user.role === "manager" && existing.createdBy.toString() !== req.user.id)
       return res.status(403).json({ error: "Not authorized" });
 
@@ -260,6 +340,9 @@ router.put("/campaigns/:id", protect, allowRoles("super_admin", "manager"), asyn
     if (templateId) {
       const Template = require("../models/Template");
       const template = await Template.findById(templateId).lean();
+      if (!template || !(await canAccessTemplate(req, template))) {
+        return res.status(403).json({ error: "Template belongs to another organization" });
+      }
       if (template?.variables) {
         for (const [key, varDef] of Object.entries(template.variables)) {
           if (!finalVariableValues[key]) finalVariableValues[key] = { type: varDef.type, value: varDef.value || "" };
@@ -286,6 +369,7 @@ router.put("/campaigns/:id", protect, allowRoles("super_admin", "manager"), asyn
         variableValues: finalVariableValues,
         messagePreview: messagePreview || existing.messagePreview,
         approvalStatus,
+        organization: existing.organization || req.user.organization || null,
         status: req.user.role === "manager" ? "draft" : existing.status,
         nextRun,
       },
@@ -300,6 +384,7 @@ router.put("/campaigns/:id", protect, allowRoles("super_admin", "manager"), asyn
         type: "campaign_approval_requested",
         message: `${managerName} re-submitted an updated campaign for approval: "${updated.campaignName}"`,
         campaignId: updated._id,
+        organization: req.user.organization,
       });
     }
 
@@ -315,6 +400,9 @@ router.delete("/campaigns/:id", protect, allowRoles("super_admin", "manager"), a
   try {
     const campaign = await Campaign.findById(req.params.id);
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    if (!(await canAccessCampaign(req, campaign))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
     if (req.user.role === "manager" && campaign.createdBy.toString() !== req.user.id)
       return res.status(403).json({ error: "Not authorized" });
     await Campaign.findByIdAndDelete(req.params.id);
@@ -333,6 +421,9 @@ router.patch("/campaigns/:id/status", protect, allowRoles("super_admin", "manage
     if (!status || !validStatuses.includes(status)) return res.status(400).json({ error: "Invalid status" });
     const campaign = await Campaign.findById(req.params.id);
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    if (!(await canAccessCampaign(req, campaign))) {
+      return res.status(403).json({ error: "Not authorized for this organization" });
+    }
     if (req.user.role === "manager" && campaign.createdBy.toString() !== req.user.id)
       return res.status(403).json({ error: "Not authorized" });
     campaign.status = status;

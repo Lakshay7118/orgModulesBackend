@@ -74,6 +74,12 @@ const CampaignSchema = new mongoose.Schema(
       required: true,
     },
 
+    organization: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization",
+      default: null,
+    },
+
     nextRun: { type: Date },
     sentCount: { type: Number, default: 0 },
     processingStartedAt: { type: Date, default: null },
@@ -92,6 +98,7 @@ CampaignSchema.index(
   { createdBy: 1, launchKey: 1 },
   { partialFilterExpression: { launchKey: { $type: "string" } } }
 );
+CampaignSchema.index({ organization: 1, createdAt: -1 });
 CampaignSchema.index({ status: 1, approvalStatus: 1, nextRun: 1 });
 
 module.exports = mongoose.model("Campaign", CampaignSchema);

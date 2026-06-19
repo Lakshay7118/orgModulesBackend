@@ -139,8 +139,17 @@ const TemplateSchema = new mongoose.Schema(
       ref: "User",
       required: true,
     },
+
+    organization: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization",
+      default: null,
+    },
   },
   { timestamps: true }
 );
+
+TemplateSchema.index({ organization: 1, createdAt: -1 });
+TemplateSchema.index({ createdBy: 1, createdAt: -1 });
 
 module.exports = mongoose.model("Template", TemplateSchema);

@@ -13,6 +13,46 @@ const router = express.Router();
 
 const TOP_ADMIN_ROLES = ["super_to_super_admin", "super_admin"];
 const isTopAdmin = (role) => TOP_ADMIN_ROLES.includes(role);
+const sameId = (left, right) => left && right && String(left) === String(right);
+
+const organizationUserIds = async (organization) => {
+  if (!organization) return [];
+  const users = await User.find({ organization }).select("_id").lean();
+  return users.map((user) => user._id);
+};
+
+const scopedTemplateFilter = async (req, filter = {}) => {
+  if (req.user.role === "super_to_super_admin") return filter;
+
+  if (!req.user.organization) {
+    return { $and: [{ createdBy: req.user.id }, filter] };
+  }
+
+  const orgUsers = await organizationUserIds(req.user.organization);
+  return {
+    $and: [
+      {
+        $or: [
+          { organization: req.user.organization },
+          { organization: null, createdBy: { $in: orgUsers } },
+        ],
+      },
+      filter,
+    ],
+  };
+};
+
+const canAccessTemplate = async (req, template) => {
+  if (req.user.role === "super_to_super_admin") return true;
+  if (!template) return false;
+  if (sameId(template.organization, req.user.organization)) return true;
+  if (!template.organization && template.createdBy) {
+    const creatorId = template.createdBy._id || template.createdBy;
+    const creator = await User.findById(creatorId).select("organization").lean();
+    return sameId(creator?.organization, req.user.organization);
+  }
+  return false;
+};
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
@@ -37,9 +77,17 @@ const uploadToCloudinary = (buffer) => {
 };
 
 // ── Shared helper: notify all admins ────────────────────────────
-async function notifyAdmins({ type, message, templateId }) {
+async function notifyAdmins({ type, message, templateId, organization }) {
   const io = getIO();
-  const admins = await User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
+  const query = organization
+    ? {
+        $or: [
+          { role: "super_to_super_admin" },
+          { role: "super_admin", organization },
+        ],
+      }
+    : { role: { $in: TOP_ADMIN_ROLES } };
+  const admins = await User.find(query).select("_id").lean();
   for (const admin of admins) {
     const notif = await Notification.create({
       userId: admin._id,
@@ -73,7 +121,8 @@ router.get(
   allowRoles("super_admin"),
   async (req, res) => {
     try {
-      const templates = await Template.find({ approvalStatus: "pending_approval" })
+      const filter = await scopedTemplateFilter(req, { approvalStatus: "pending_approval" });
+      const templates = await Template.find(filter)
         .populate("createdBy", "name phone role")
         .sort({ createdAt: -1 });
       res.json({ success: true, templates });
@@ -93,13 +142,17 @@ router.put(
   allowRoles("super_admin"),
   async (req, res) => {
     try {
+      const existing = await Template.findById(req.params.id);
+      if (!existing) return res.status(404).json({ error: "Template not found" });
+      if (!(await canAccessTemplate(req, existing))) {
+        return res.status(403).json({ error: "Not authorized for this organization" });
+      }
+
       const template = await Template.findByIdAndUpdate(
         req.params.id,
-        { approvalStatus: "approved", status: "APPROVED" },
+        { approvalStatus: "approved", status: "APPROVED", organization: existing.organization || req.user.organization || null },
         { new: true }
       ).populate("createdBy", "name phone role");
-
-      if (!template) return res.status(404).json({ error: "Template not found" });
 
       // ✅ Notify the manager their template was approved
       await notifyUser({
@@ -126,13 +179,17 @@ router.put(
   allowRoles("super_admin"),
   async (req, res) => {
     try {
+      const existing = await Template.findById(req.params.id);
+      if (!existing) return res.status(404).json({ error: "Template not found" });
+      if (!(await canAccessTemplate(req, existing))) {
+        return res.status(403).json({ error: "Not authorized for this organization" });
+      }
+
       const template = await Template.findByIdAndUpdate(
         req.params.id,
-        { approvalStatus: "rejected", status: "REJECTED" },
+        { approvalStatus: "rejected", status: "REJECTED", organization: existing.organization || req.user.organization || null },
         { new: true }
       ).populate("createdBy", "name phone role");
-
-      if (!template) return res.status(404).json({ error: "Template not found" });
 
       // ✅ Notify the manager their template was rejected
       await notifyUser({
@@ -162,6 +219,7 @@ router.get(
       let filter = {};
       if (req.user.role === "manager") filter.createdBy = req.user.id;
       else if (req.user.role === "user") filter.approvalStatus = "approved";
+      filter = await scopedTemplateFilter(req, filter);
 
       const templates = await Template.find(filter)
         .populate("createdBy", "name phone role")
@@ -237,6 +295,7 @@ router.post(
         status: "DRAFT",
         approvalStatus,
         createdBy: req.user.id,
+        organization: req.user.organization || null,
       });
 
       await template.save();
@@ -250,6 +309,7 @@ router.post(
           type: "template_approval_requested",
           message: `${managerName} submitted a new template for approval: "${template.name}"`,
           templateId: template._id,
+          organization: req.user.organization,
         });
       }
 
@@ -282,6 +342,9 @@ router.get(
         .populate("createdBy", "name phone role");
 
       if (!template) return res.status(404).json({ error: "Template not found" });
+      if (!(await canAccessTemplate(req, template))) {
+        return res.status(403).json({ error: "Not authorized for this organization" });
+      }
 
       if (req.user.role === "manager" && template.createdBy._id.toString() !== req.user.id) {
         return res.status(403).json({ error: "Not authorized" });
@@ -312,6 +375,9 @@ router.put(
       const existing = await Template.findById(templateId);
 
       if (!existing) return res.status(404).json({ error: "Template not found" });
+      if (!(await canAccessTemplate(req, existing))) {
+        return res.status(403).json({ error: "Not authorized for this organization" });
+      }
 
       if (req.user.role === "manager" && existing.createdBy.toString() !== req.user.id) {
         return res.status(403).json({ error: "Not authorized" });
@@ -368,6 +434,7 @@ router.put(
           inputFields,
           variables,
           approvalStatus,
+          organization: existing.organization || req.user.organization || null,
           updatedAt: Date.now(),
         },
         { new: true }
@@ -382,6 +449,7 @@ router.put(
           type: "template_approval_requested",
           message: `${managerName} re-submitted an updated template for approval: "${updated.name}"`,
           templateId: updated._id,
+          organization: req.user.organization,
         });
       }
 
@@ -407,8 +475,12 @@ router.delete(
   allowRoles("super_admin"),
   async (req, res) => {
     try {
-      const deleted = await Template.findByIdAndDelete(req.params.id);
-      if (!deleted) return res.status(404).json({ error: "Template not found" });
+      const existing = await Template.findById(req.params.id);
+      if (!existing) return res.status(404).json({ error: "Template not found" });
+      if (!(await canAccessTemplate(req, existing))) {
+        return res.status(403).json({ error: "Not authorized for this organization" });
+      }
+      await existing.deleteOne();
       res.json({ success: true, message: "Template deleted" });
     } catch (error) {
       res.status(500).json({ error: error.message });
