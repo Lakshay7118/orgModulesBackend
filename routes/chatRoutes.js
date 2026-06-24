@@ -24,6 +24,7 @@ router.post("/", protect, async (req, res) => {
     if (!receiverPhone) return res.status(400).json({ error: "receiverPhone is required" });
 
     let chat = await Chat.findOne({
+      isGroup: false,
       participants: { $all: [senderPhone, receiverPhone] },
     });
 
