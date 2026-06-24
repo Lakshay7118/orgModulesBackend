@@ -16,6 +16,7 @@ const User = require("../models/Users");
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 const requireModule = require("../middleware/moduleMiddleware");
+const { normalizeHrPermissions, userHasHrPermission } = require("../utils/hrPermissions");
 
 
 router.use(protect);
@@ -114,6 +115,8 @@ const resolveCreatableRole = (req, requestedRole) => {
   }
   return role;
 };
+const canAssignHrPermissions = (req, targetRole) =>
+  ["super_to_super_admin", "super_admin"].includes(req.user.role) && ["manager", "hr"].includes(targetRole);
 const organizationUserIds = async (organization) => {
   if (!organization) return [];
   const orgUsers = await User.find({ organization }).select("_id").lean();
@@ -217,6 +220,14 @@ const sendHrError = (res, error, fallback = "HR request failed") => {
   }
 
   return res.status(500).json({ error: error?.message || fallback });
+};
+const requireHrPermission = (permission) => (req, res, next) => {
+  if (userHasHrPermission(req.user, permission)) return next();
+  return res.status(403).json({ error: "You do not have permission for this HR action." });
+};
+const requireAnyHrPermission = (...permissions) => (req, res, next) => {
+  if (permissions.some((permission) => userHasHrPermission(req.user, permission))) return next();
+  return res.status(403).json({ error: "You do not have permission for this HR action." });
 };
 const buildPeriodFromDueDate = (dueDate, cycleStartDay = 1) => {
   const safeCycleDay = normalizeCycleDay(cycleStartDay);
@@ -847,6 +858,8 @@ router.use(requireModule("hr"), allowRoles("super_to_super_admin", "super_admin"
 
 router.get("/summary", async (req, res) => {
   try {
+    const canViewBanks = userHasHrPermission(req.user, "canViewBanks");
+    const canViewAdvances = userHasHrPermission(req.user, "canManageAdvances");
     const [departmentScope, activeStaffScope] = await Promise.all([
       mergeDepartmentScope(req),
       mergeStaffScope(req, { status: "active" }),
@@ -868,8 +881,8 @@ router.get("/summary", async (req, res) => {
       data: {
         departmentCount,
         activeStaffCount,
-        bankBalance: money(bankBalance),
-        loanOutstanding: money(loanOutstanding),
+        bankBalance: canViewBanks ? money(bankBalance) : 0,
+        loanOutstanding: canViewAdvances ? money(loanOutstanding) : 0,
         dues: money(dues),
         pendingPayrolls: unpaidPayrolls.length,
       },
@@ -999,7 +1012,7 @@ router.get("/staff", async (req, res) => {
   }
 });
 
-router.post("/contact-staff", async (req, res) => {
+router.post("/contact-staff", requireHrPermission("canAddStaff"), async (req, res) => {
   try {
     const contactInput = req.body.contact || {};
     const staffInput = req.body.staff || {};
@@ -1072,6 +1085,9 @@ router.post("/contact-staff", async (req, res) => {
         user.role = role;
         if (!user.organization && organization) user.organization = organization;
         if (!user.allowedModules?.length) user.allowedModules = req.user.allowedModules || [];
+        if (canAssignHrPermissions(req, role)) {
+          user.hrPermissions = normalizeHrPermissions(contactInput.hrPermissions);
+        }
         await user.save();
       } else {
         await User.create({
@@ -1082,6 +1098,9 @@ router.post("/contact-staff", async (req, res) => {
           role,
           organization,
           allowedModules: req.user.allowedModules || [],
+          hrPermissions: canAssignHrPermissions(req, role)
+            ? normalizeHrPermissions(contactInput.hrPermissions)
+            : undefined,
           createdBy: req.user.id,
         });
       }
@@ -1137,7 +1156,7 @@ router.get("/staff/:id", async (req, res) => {
   }
 });
 
-router.post("/staff", async (req, res) => {
+router.post("/staff", requireHrPermission("canAddStaff"), async (req, res) => {
   try {
     const name = String(req.body.name || "").trim();
     const department = req.body.department || null;
@@ -1178,7 +1197,7 @@ router.post("/staff", async (req, res) => {
   }
 });
 
-router.patch("/staff/:id", async (req, res) => {
+router.patch("/staff/:id", requireHrPermission("canEditStaff"), async (req, res) => {
   try {
     const existing = await HRStaff.findById(req.params.id);
     if (!existing) return res.status(404).json({ error: "Staff not found" });
@@ -1235,7 +1254,7 @@ router.patch("/staff/:id", async (req, res) => {
   }
 });
 
-router.delete("/staff/:id", async (req, res) => {
+router.delete("/staff/:id", requireHrPermission("canDeleteStaff"), async (req, res) => {
   try {
     const staff = await HRStaff.findById(req.params.id);
     if (!staff) return res.status(404).json({ error: "Staff not found" });
@@ -1301,7 +1320,7 @@ router.get("/attendance", async (req, res) => {
   }
 });
 
-router.post("/attendance", async (req, res) => {
+router.post("/attendance", requireHrPermission("canMarkAttendance"), async (req, res) => {
   try {
     const status = req.body.status;
     if (!ATTENDANCE_STATUSES.includes(status)) {
@@ -1362,7 +1381,7 @@ router.post("/attendance", async (req, res) => {
   }
 });
 
-router.get("/banks", async (req, res) => {
+router.get("/banks", requireAnyHrPermission("canViewBanks", "canManageBanks", "canMakePayments"), async (req, res) => {
   try {
     const banks = await HRBank.find().sort({ createdAt: -1 });
     res.json({ success: true, data: banks });
@@ -1371,7 +1390,7 @@ router.get("/banks", async (req, res) => {
   }
 });
 
-router.get("/banks/transactions", async (req, res) => {
+router.get("/banks/transactions", requireHrPermission("canViewBanks"), async (req, res) => {
   try {
     const filter = {};
     if (req.query.bank) filter.bank = req.query.bank;
@@ -1439,7 +1458,7 @@ router.get("/banks/transactions", async (req, res) => {
   }
 });
 
-router.post("/banks", async (req, res) => {
+router.post("/banks", requireHrPermission("canManageBanks"), async (req, res) => {
   try {
     const bank = await HRBank.create({
       name: req.body.name,
@@ -1454,7 +1473,7 @@ router.post("/banks", async (req, res) => {
   }
 });
 
-router.patch("/banks/:id", async (req, res) => {
+router.patch("/banks/:id", requireHrPermission("canManageBanks"), async (req, res) => {
   try {
     const updates = {};
     ["name", "accountName", "accountNumber"].forEach((field) => {
@@ -1469,7 +1488,7 @@ router.patch("/banks/:id", async (req, res) => {
   }
 });
 
-router.post("/banks/:id/add-money", async (req, res) => {
+router.post("/banks/:id/add-money", requireHrPermission("canManageBanks"), async (req, res) => {
   try {
     const amount = money(req.body.amount);
     if (amount <= 0) return res.status(400).json({ error: "Amount must be greater than 0" });
@@ -1498,7 +1517,7 @@ router.post("/banks/:id/add-money", async (req, res) => {
   }
 });
 
-router.post("/banks/:id/pay-now", async (req, res) => {
+router.post("/banks/:id/pay-now", requireHrPermission("canMakePayments"), async (req, res) => {
   try {
     const amount = money(req.body.amount);
     if (amount <= 0) return res.status(400).json({ error: "Amount must be greater than 0" });
@@ -1537,7 +1556,7 @@ router.post("/banks/:id/pay-now", async (req, res) => {
   }
 });
 
-router.post("/banks/:id/payment", async (req, res) => {
+router.post("/banks/:id/payment", requireHrPermission("canMakePayments"), async (req, res) => {
   try {
     const amount = money(req.body.amount);
     if (amount <= 0) return res.status(400).json({ error: "Amount must be greater than 0" });
@@ -1574,6 +1593,9 @@ router.post("/banks/:id/payment", async (req, res) => {
       }
 
       if (direction === "out" && req.body.purpose === "advance") {
+        if (!userHasHrPermission(req.user, "canManageAdvances")) {
+          return res.status(403).json({ error: "You do not have permission to manage employee advances." });
+        }
         const emi = amount;
 
         loan = await HRLoan.create({
@@ -1590,6 +1612,9 @@ router.post("/banks/:id/payment", async (req, res) => {
         transactionType = "advance_out";
         loanOutstandingAfter = money(loan.outstanding);
       } else if (req.body.loan) {
+        if (!userHasHrPermission(req.user, "canManageAdvances")) {
+          return res.status(403).json({ error: "You do not have permission to manage employee advances." });
+        }
         loan = await HRLoan.findById(req.body.loan);
         if (!loan || loan.category !== "advance") return res.status(404).json({ error: "Advance not found" });
         if (idOfDoc(loan.staff) !== idOfDoc(staff._id)) {
@@ -1675,7 +1700,7 @@ router.post("/banks/:id/payment", async (req, res) => {
   }
 });
 
-router.get("/loans", async (req, res) => {
+router.get("/loans", requireHrPermission("canManageAdvances"), async (req, res) => {
   try {
     const filter = { category: "advance" };
     if (req.query.staff) filter.staff = req.query.staff;
@@ -1688,7 +1713,7 @@ router.get("/loans", async (req, res) => {
   }
 });
 
-router.post("/loans", async (req, res) => {
+router.post("/loans", requireHrPermission("canManageAdvances"), async (req, res) => {
   try {
     const amount = money(req.body.amount);
     const category = "advance";
@@ -1715,7 +1740,7 @@ router.post("/loans", async (req, res) => {
   }
 });
 
-router.patch("/loans/:id", async (req, res) => {
+router.patch("/loans/:id", requireHrPermission("canManageAdvances"), async (req, res) => {
   try {
     const updates = {};
     ["note", "status"].forEach((field) => {
@@ -1759,7 +1784,7 @@ router.get("/payroll", async (req, res) => {
   }
 });
 
-router.post("/payroll/generate", async (req, res) => {
+router.post("/payroll/generate", requireHrPermission("canGenerateSalarySlip"), async (req, res) => {
   try {
     await syncPayrollIndexes();
 
@@ -1809,7 +1834,7 @@ router.post("/payroll/generate", async (req, res) => {
   }
 });
 
-router.post("/payroll/:id/pay", async (req, res) => {
+router.post("/payroll/:id/pay", requireHrPermission("canMakePayments"), async (req, res) => {
   try {
     const payroll = await HRPayroll.findById(req.params.id);
     if (!payroll) return res.status(404).json({ error: "Payroll not found" });

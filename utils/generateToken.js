@@ -9,6 +9,7 @@ const generateToken = (user) => {
       role: user.role,
       organization: user.organization,
       allowedModules: user.allowedModules || [],
+      hrPermissions: user.hrPermissions || {},
       isActive: user.isActive !== false,
     },
     process.env.JWT_SECRET,

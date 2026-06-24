@@ -11,8 +11,9 @@ const ProfileChangeRequest = require("../models/ProfileChangeRequest");
 const SupportTicket = require("../models/SupportTicket");
 const generateToken = require("../utils/generateToken");
 const { getIO } = require("../sockets/socket");
+const { normalizeHrPermissions } = require("../utils/hrPermissions");
 
-const PUBLIC_USER_FIELDS = "name phone email role organization allowedModules isActive createdAt updatedAt";
+const PUBLIC_USER_FIELDS = "name phone email role organization allowedModules hrPermissions isActive createdAt updatedAt";
 
 const emitNotification = (phone, notification) => {
   try {
@@ -163,6 +164,9 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
+    const organization = user.organization
+      ? await Organization.findById(user.organization).select("name").lean()
+      : null;
     const token = generateToken(user);
 
     res.json({
@@ -174,7 +178,9 @@ router.post("/login", async (req, res) => {
         phone: user.phone,
         role: user.role,
         organization: user.organization,
+        organizationName: organization?.name || "",
         allowedModules: user.allowedModules || [],
+        hrPermissions: user.hrPermissions || {},
         isActive: user.isActive !== false,
       },
     });
@@ -194,7 +200,7 @@ router.get("/", protect, allowRoles("super_to_super_admin", "super_admin", "mana
     const query = req.user.role === "super_to_super_admin"
       ? {}
       : { organization: req.user.organization };
-    const users = await User.find(query).select("name phone email role organization allowedModules isActive").lean();
+    const users = await User.find(query).select("name phone email role organization allowedModules hrPermissions isActive").lean();
     res.json({ success: true, data: users });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -206,9 +212,19 @@ router.get("/", protect, allowRoles("super_to_super_admin", "super_admin", "mana
 // =======================
 router.get("/me", protect, async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select(PUBLIC_USER_FIELDS).lean();
+    const user = await User.findById(req.user.id)
+      .select(PUBLIC_USER_FIELDS)
+      .populate("organization", "name")
+      .lean();
     if (!user) return res.status(404).json({ error: "User not found" });
-    res.json({ success: true, data: user });
+    res.json({
+      success: true,
+      data: {
+        ...user,
+        organizationName: user.organization?.name || "",
+        organization: user.organization?._id || user.organization,
+      },
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -694,6 +710,9 @@ router.post(
         role: targetRole,
         organization: req.user.organization,
         allowedModules,
+        hrPermissions: ["super_to_super_admin", "super_admin"].includes(req.user.role) && ["manager", "hr"].includes(targetRole)
+          ? normalizeHrPermissions(req.body.hrPermissions)
+          : undefined,
         createdBy: req.user.id,
       });
 

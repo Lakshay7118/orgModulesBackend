@@ -9,7 +9,7 @@ const protect = async (req, res, next) => {
 
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       const user = await User.findById(decoded.id)
-        .select("name phone email role isActive organization allowedModules")
+        .select("name phone email role isActive organization allowedModules hrPermissions")
         .lean();
 
       if (!user) {
@@ -40,6 +40,7 @@ const protect = async (req, res, next) => {
         role: user.role,
         organization: user.organization,
         allowedModules: user.allowedModules || [],
+        hrPermissions: user.hrPermissions || {},
         isActive: user.isActive !== false,
       };
       return next();

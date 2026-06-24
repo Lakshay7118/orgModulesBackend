@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { DEFAULT_HR_PERMISSIONS } = require("../utils/hrPermissions");
 
 const UserSchema = new mongoose.Schema({
   name: String,
@@ -18,6 +19,20 @@ const UserSchema = new mongoose.Schema({
     type: [String],
     enum: ["hr", "task", "chat"],
     default: [],
+  },
+  hrPermissions: {
+    type: {
+      canViewBanks: { type: Boolean, default: true },
+      canManageBanks: { type: Boolean, default: true },
+      canMakePayments: { type: Boolean, default: true },
+      canManageAdvances: { type: Boolean, default: true },
+      canAddStaff: { type: Boolean, default: true },
+      canEditStaff: { type: Boolean, default: true },
+      canDeleteStaff: { type: Boolean, default: true },
+      canMarkAttendance: { type: Boolean, default: true },
+      canGenerateSalarySlip: { type: Boolean, default: true },
+    },
+    default: DEFAULT_HR_PERMISSIONS,
   },
   isActive: { type: Boolean, default: true },
   createdBy: {

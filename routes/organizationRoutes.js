@@ -211,6 +211,7 @@ router.post("/:id/login-as", protect, allowRoles("super_to_super_admin"), async 
         phone: superAdmin.phone,
         role: superAdmin.role,
         organization: superAdmin.organization,
+        organizationName: organization.name || "",
         allowedModules: superAdmin.allowedModules || [],
         isActive: superAdmin.isActive !== false,
       },

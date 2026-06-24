@@ -6,6 +6,7 @@ const Notification = require("../models/Notification");
 const { getIO } = require("../sockets/socket");
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
+const { normalizeHrPermissions } = require("../utils/hrPermissions");
 const router = express.Router();
 
 const TOP_ADMIN_ROLES = ["super_to_super_admin", "super_admin"];
@@ -15,6 +16,8 @@ const sameId = (left, right) =>
   left && right && String(left) === String(right);
 
 const isTopAdmin = (role) => TOP_ADMIN_ROLES.includes(role);
+const canAssignHrPermissions = (req, targetRole) =>
+  isTopAdmin(req.user.role) && ["manager", "hr"].includes(targetRole);
 
 const creatableRolesByRole = {
   super_to_super_admin: ["super_admin", "manager", "hr", "user"],
@@ -84,7 +87,7 @@ const attachLoginUsers = async (contacts = []) => {
   );
   const phones = plainContacts.map((contact) => contact.mobile).filter(Boolean);
   const users = await User.find({ phone: { $in: phones } })
-    .select("_id name phone email role isActive")
+    .select("_id name phone email role isActive hrPermissions")
     .lean();
   const usersByPhone = new Map(users.map((user) => [String(user.phone), user]));
 
@@ -99,6 +102,7 @@ const attachLoginUsers = async (contacts = []) => {
             phone: user.phone,
             email: user.email,
             role: user.role,
+            hrPermissions: normalizeHrPermissions(user.hrPermissions),
             isActive: user.isActive !== false,
           }
         : null,
@@ -169,7 +173,7 @@ router.get("/contacts/pending", protect, allowRoles("super_admin"), async (req, 
 // CREATE CONTACT
 router.post("/contacts", protect, allowRoles("super_admin", "manager", "hr"), async (req, res) => {
   try {
-    const { name, mobile, email, password, tags, source, role } = req.body;
+    const { name, mobile, email, password, tags, source, role, hrPermissions } = req.body;
     if (!mobile) return res.status(400).json({ error: "Mobile number required" });
     const targetRole = resolveCreatableRole(req, role);
 
@@ -195,6 +199,9 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager", "hr"), as
       if (user) {
         user.email = email.toLowerCase(); user.password = hashedPassword;
         user.name = name || user.name; user.role = targetRole;
+        if (canAssignHrPermissions(req, targetRole)) {
+          user.hrPermissions = normalizeHrPermissions(hrPermissions);
+        }
         await user.save();
       } else {
         await User.create({
@@ -205,6 +212,9 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager", "hr"), as
           role: targetRole,
           organization: req.user.organization,
           allowedModules: req.user.allowedModules || [],
+          hrPermissions: canAssignHrPermissions(req, targetRole)
+            ? normalizeHrPermissions(hrPermissions)
+            : undefined,
           createdBy: req.user.id,
         });
       }
@@ -296,7 +306,7 @@ router.put("/contacts/:id/reject", protect, allowRoles("super_admin"), async (re
 // UPDATE CONTACT
 router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async (req, res) => {
   try {
-    const { name, mobile, email, password, tags, source, role } = req.body;
+    const { name, mobile, email, password, tags, source, role, hrPermissions } = req.body;
     const contactId = req.params.id;
     const contact = await Contact.findById(contactId);
     if (!contact) return res.status(404).json({ error: "Contact not found" });
@@ -339,7 +349,7 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
       });
     }
 
-    if (isTopAdmin(req.user.role) && (email || password)) {
+    if (isTopAdmin(req.user.role) && (email || password || hrPermissions !== undefined)) {
       const phoneLookup = mobile || contact.mobile;
       let user = await User.findOne({ phone: phoneLookup });
       if (user) {
@@ -347,6 +357,10 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
         if (password) user.password = await bcrypt.hash(password, 10);
         if (name) user.name = name;
         if (role) user.role = role;
+        const effectiveRole = role || user.role || contact.role;
+        if (canAssignHrPermissions(req, effectiveRole)) {
+          user.hrPermissions = normalizeHrPermissions(hrPermissions);
+        }
         await user.save();
       } else if (email && password) {
         await User.create({
@@ -357,6 +371,9 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
           role: role || contact.role,
           organization: req.user.organization,
           allowedModules: req.user.allowedModules || [],
+          hrPermissions: canAssignHrPermissions(req, role || contact.role)
+            ? normalizeHrPermissions(hrPermissions)
+            : undefined,
           createdBy: req.user.id,
         });
       }
