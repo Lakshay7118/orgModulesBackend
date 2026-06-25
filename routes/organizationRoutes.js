@@ -12,6 +12,7 @@ const generateToken = require("../utils/generateToken");
 const router = express.Router();
 
 const MODULES = ["hr", "task", "chat"];
+const SUPER_ADMIN_SELECT = "name phone email password role allowedModules isActive";
 
 const cleanModules = (modules = []) => {
   if (!Array.isArray(modules)) return [];
@@ -19,12 +20,12 @@ const cleanModules = (modules = []) => {
 };
 
 const populateOrganization = (query) =>
-  query.populate("superAdmin", "name phone email role allowedModules isActive").lean();
+  query.populate("superAdmin", SUPER_ADMIN_SELECT).lean();
 
 router.get("/", protect, allowRoles("super_to_super_admin"), async (req, res) => {
   try {
     const organizations = await Organization.find()
-      .populate("superAdmin", "name phone email role allowedModules isActive")
+      .populate("superAdmin", SUPER_ADMIN_SELECT)
       .sort({ createdAt: -1 })
       .lean();
 
@@ -100,6 +101,7 @@ router.post("/", protect, allowRoles("super_to_super_admin"), async (req, res) =
           name: superAdmin.name,
           phone: superAdmin.phone,
           email: superAdmin.email,
+          password: superAdmin.password,
           role: superAdmin.role,
           organization: superAdmin.organization,
           allowedModules: superAdmin.allowedModules,
@@ -184,7 +186,8 @@ router.patch("/:id/super-admin/password", protect, allowRoles("super_to_super_ad
       password: await bcrypt.hash(password, 10),
     });
 
-    res.json({ success: true, message: "Password updated" });
+    const updatedOrganization = await populateOrganization(Organization.findById(organization._id));
+    res.json({ success: true, message: "Password updated", data: updatedOrganization });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
