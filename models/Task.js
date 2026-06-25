@@ -11,6 +11,13 @@ const TaskSchema = new mongoose.Schema(
       required: true,
     },
 
+    organization: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization",
+      default: null,
+      index: true,
+    },
+
     assignedTo: [
       {
         type: mongoose.Schema.Types.ObjectId,

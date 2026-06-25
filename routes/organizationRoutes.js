@@ -7,6 +7,8 @@ const User = require("../models/Users");
 const Contact = require("../models/Contact");
 const HRDepartment = require("../models/HRDepartment");
 const HRStaff = require("../models/HRStaff");
+const Task = require("../models/Task");
+const UserTaskStatus = require("../models/UserTaskStatus");
 const generateToken = require("../utils/generateToken");
 
 const router = express.Router();
@@ -259,12 +261,15 @@ router.delete("/:id", protect, allowRoles("super_to_super_admin"), async (req, r
         { organization: null, createdBy: { $in: orgUserIds } },
       ],
     };
+    const orgTaskIds = await Task.find(orgOwnedQuery).select("_id").lean();
 
     await Promise.all([
       User.deleteMany({ organization: organization._id }),
       Contact.deleteMany(orgOwnedQuery),
       HRDepartment.deleteMany(orgOwnedQuery),
       HRStaff.deleteMany(orgOwnedQuery),
+      Task.deleteMany(orgOwnedQuery),
+      UserTaskStatus.deleteMany({ taskId: { $in: orgTaskIds.map((task) => task._id) } }),
     ]);
 
     await Organization.deleteOne({ _id: organization._id });

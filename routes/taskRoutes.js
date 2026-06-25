@@ -10,6 +10,7 @@ const allowRoles = require("../middleware/roleMiddleware");
 
 const TOP_ADMIN_ROLES = ["super_to_super_admin", "super_admin"];
 const isTopAdmin = (role) => TOP_ADMIN_ROLES.includes(role);
+const sameId = (left, right) => left && right && left.toString() === right.toString();
 
 const TASK_UPDATE_FIELDS = [
   "title", "description", "dueDate", "reminderAt", "reminders", "priority",
@@ -50,6 +51,70 @@ const normalizeReminders = (reminders, reminderAt) => {
   return { reminders: normalized, reminderAt: next?.remindAt || normalized[0]?.remindAt || null };
 };
 
+const organizationUserIds = async (organization) => {
+  if (!organization) return [];
+  const users = await User.find({ organization }).select("_id").lean();
+  return users.map((user) => user._id);
+};
+
+const taskOrganizationScope = async (req) => {
+  if (req.user.role === "super_to_super_admin") return {};
+  if (!req.user.organization) return { createdBy: req.user.id };
+  const orgUsers = await organizationUserIds(req.user.organization);
+  return {
+    $or: [
+      { organization: req.user.organization },
+      { organization: null, createdBy: { $in: orgUsers } },
+    ],
+  };
+};
+
+const andFilters = (...filters) => {
+  const active = filters.filter((filter) => filter && Object.keys(filter).length > 0);
+  if (active.length === 0) return {};
+  if (active.length === 1) return active[0];
+  return { $and: active };
+};
+
+const canAccessTaskOrganization = async (req, task) => {
+  if (!task) return false;
+  if (req.user.role === "super_to_super_admin") return true;
+  if (sameId(task.organization, req.user.organization)) return true;
+  if (!task.organization && task.createdBy) {
+    const creatorId = task.createdBy._id || task.createdBy;
+    const creator = await User.findById(creatorId).select("organization").lean();
+    return sameId(creator?.organization, req.user.organization);
+  }
+  return false;
+};
+
+const ensureTaskOrganizationAccess = async (req, task, res) => {
+  const allowed = await canAccessTaskOrganization(req, task);
+  if (!allowed) {
+    res.status(404).json({ error: "Task not found" });
+    return false;
+  }
+  return true;
+};
+
+const sameOrganizationAdmins = async (req) => {
+  if (req.user.role === "super_to_super_admin") {
+    return User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
+  }
+  if (!req.user.organization) return [];
+  return User.find({ role: "super_admin", organization: req.user.organization }).select("_id").lean();
+};
+
+const validateAssignedUsersInOrganization = async (req, assignedUserIds = []) => {
+  if (req.user.role === "super_to_super_admin" || assignedUserIds.length === 0) return true;
+  if (!req.user.organization) return assignedUserIds.every((id) => id.toString() === req.user.id);
+  const count = await User.countDocuments({
+    _id: { $in: assignedUserIds },
+    organization: req.user.organization,
+  });
+  return count === new Set(assignedUserIds.map((id) => id.toString())).size;
+};
+
 const broadcastTaskAssignmentChanges = async (task, previousAssigneeIds, io) => {
   const newAssigneeIds = task.assignedTo.map((user) => user._id.toString());
   const removedAssigneeIds = previousAssigneeIds.filter((uid) => !newAssigneeIds.includes(uid));
@@ -86,7 +151,10 @@ const broadcastTaskAssignmentChanges = async (task, previousAssigneeIds, io) => 
 // =======================
 router.get("/users", protect, allowRoles("super_admin", "manager"), async (req, res) => {
   try {
-    const users = await User.find().select("name phone role").lean();
+    const query = req.user.role === "super_to_super_admin"
+      ? {}
+      : { organization: req.user.organization };
+    const users = await User.find(query).select("name phone role organization").lean();
     res.json({ success: true, data: users });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -101,17 +169,18 @@ router.get("/", protect, async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    let filter = {};
+    let roleFilter = {};
 
     if (isTopAdmin(userRole)) {
-      filter = {};
+      roleFilter = {};
     } else if (userRole === "manager") {
-      filter = {
+      roleFilter = {
         $or: [{ createdBy: userId }, { assignedTo: userId }],
       };
     } else {
-      filter = { assignedTo: userId };
+      roleFilter = { assignedTo: userId };
     }
+    const filter = andFilters(await taskOrganizationScope(req), roleFilter);
 
     const tasks = await Task.find(filter)
       .populate("createdBy", "name phone role")
@@ -170,6 +239,9 @@ router.post("/", protect, allowRoles("super_admin", "manager", "user"), async (r
       // Personal task → assigned only to creator, always approved
       assignedUserIds = [req.user.id];
     }
+    if (!(await validateAssignedUsersInOrganization(req, assignedUserIds))) {
+      return res.status(403).json({ error: "Assigned users must belong to your organization" });
+    }
 
     // ── Determine approval status ────────────────────────────────
     // Admin tasks are always approved.
@@ -196,6 +268,7 @@ router.post("/", protect, allowRoles("super_admin", "manager", "user"), async (r
       title,
       description,
       createdBy: req.user.id,
+      organization: req.user.organization || null,
       assignedTo: assignedUserIds,
       isPersonal: isPersonal || false,
       dueDate,
@@ -234,7 +307,7 @@ router.post("/", protect, allowRoles("super_admin", "manager", "user"), async (r
       }
     } else {
       // Notify all admins that a task is pending their approval
-      const admins = await User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
+      const admins = await sameOrganizationAdmins(req);
       for (const admin of admins) {
         const creator = await User.findById(req.user.id).select("name").lean();
         const notif = await Notification.create({
@@ -274,6 +347,7 @@ router.patch("/:id/approve", protect, allowRoles("super_admin"), async (req, res
       .populate("pendingUpdate.requestedBy", "name phone role");
 
     if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!(await ensureTaskOrganizationAccess(req, task, res))) return;
     if (task.approvalStatus !== "pending") {
       return res.status(400).json({ error: "Task is not pending approval" });
     }
@@ -327,6 +401,9 @@ router.patch("/:id/approve", protect, allowRoles("super_admin"), async (req, res
     // ── Approved ─────────────────────────────────────────────────
     const previousAssigneeIds = task.assignedTo.map((id) => id.toString());
     if (isUpdateRequest) {
+      if (task.pendingUpdate.changes?.assignedTo && !(await validateAssignedUsersInOrganization(req, task.pendingUpdate.changes.assignedTo))) {
+        return res.status(403).json({ error: "Assigned users must belong to your organization" });
+      }
       Object.assign(task, task.pendingUpdate.changes);
       task.pendingUpdate = { requestedBy: null, changes: null, requestedAt: null };
     }
@@ -385,6 +462,7 @@ router.put("/:id", protect, allowRoles("super_admin", "manager"), async (req, re
   try {
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!(await ensureTaskOrganizationAccess(req, task, res))) return;
 
     const isCreator = task.createdBy.toString() === req.user.id;
     const isAdmin = isTopAdmin(req.user.role);
@@ -393,6 +471,9 @@ router.put("/:id", protect, allowRoles("super_admin", "manager"), async (req, re
     }
 
     const updates = pickTaskUpdates(req.body);
+    if (updates.assignedTo && !(await validateAssignedUsersInOrganization(req, updates.assignedTo))) {
+      return res.status(403).json({ error: "Assigned users must belong to your organization" });
+    }
     const previousAssigneeIds = task.assignedTo.map((id) => id.toString());
 
     if (!isAdmin && task.approvalStatus === "pending" && !task.pendingUpdate?.changes) {
@@ -406,7 +487,7 @@ router.put("/:id", protect, allowRoles("super_admin", "manager"), async (req, re
         .populate("pendingUpdate.requestedBy", "name phone role");
 
       const io = getIO();
-      const admins = await User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
+      const admins = await sameOrganizationAdmins(req);
       admins.forEach((admin) => {
         io.to(admin._id.toString()).emit("taskUpdated", populatedTask);
       });
@@ -436,7 +517,7 @@ router.put("/:id", protect, allowRoles("super_admin", "manager"), async (req, re
         .populate("pendingUpdate.requestedBy", "name phone role");
 
       const io = getIO();
-      const admins = await User.find({ role: { $in: TOP_ADMIN_ROLES } }).select("_id").lean();
+      const admins = await sameOrganizationAdmins(req);
       const creator = await User.findById(req.user.id).select("name").lean();
       for (const admin of admins) {
         const notif = await Notification.create({
@@ -487,6 +568,7 @@ router.delete("/:id", protect, allowRoles("super_admin", "manager"), async (req,
   try {
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!(await ensureTaskOrganizationAccess(req, task, res))) return;
 
     const isAdmin = isTopAdmin(req.user.role);
     const isCreator = task.createdBy.toString() === req.user.id;
@@ -517,6 +599,7 @@ router.post("/:id/response", protect, async (req, res) => {
   try {
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!(await ensureTaskOrganizationAccess(req, task, res))) return;
 
     const isAssignee = task.assignedTo.some((id) => id.toString() === req.user.id);
     const isCreator = task.createdBy.toString() === req.user.id;
@@ -598,6 +681,7 @@ router.delete("/:id/response/:responseId", protect, async (req, res) => {
   try {
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!(await ensureTaskOrganizationAccess(req, task, res))) return;
 
     const response = task.responses.id(req.params.responseId);
     if (!response) return res.status(404).json({ error: "Response not found" });
@@ -630,6 +714,7 @@ router.patch("/:id/status", protect, async (req, res) => {
   try {
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!(await ensureTaskOrganizationAccess(req, task, res))) return;
 
     const isAssignee = task.assignedTo.some((id) => id.toString() === req.user.id);
     const isCreator = task.createdBy.toString() === req.user.id;
@@ -728,17 +813,22 @@ router.get("/user-statuses", protect, async (req, res) => {
     const userId = req.user.id;
     const userRole = req.user.role;
 
-    let taskFilter = {};
+    let roleFilter = {};
     if (!isTopAdmin(userRole)) {
-      taskFilter = { assignedTo: userId };
+      roleFilter = { assignedTo: userId };
     }
+    const taskFilter = andFilters(await taskOrganizationScope(req), roleFilter);
     const visibleTaskIds = (await Task.find(taskFilter).select("_id").lean())
       .map(t => t._id.toString());
+    const statusUserFilter = isTopAdmin(userRole)
+      ? (req.user.role === "super_to_super_admin"
+        ? { role: { $nin: TOP_ADMIN_ROLES } }
+        : { role: { $nin: TOP_ADMIN_ROLES }, organization: req.user.organization })
+      : { _id: userId };
+    const statusUserIds = (await User.find(statusUserFilter).select("_id").lean()).map((user) => user._id);
 
     const statuses = await UserTaskStatus.find({
-      userId: { $in: isTopAdmin(userRole)
-        ? (await User.find({ role: { $nin: TOP_ADMIN_ROLES } }).select("_id"))
-        : [userId] },
+      userId: { $in: statusUserIds },
       taskId: { $in: visibleTaskIds },
     }).lean();
 
@@ -753,6 +843,7 @@ router.patch("/:id/user-status", protect, async (req, res) => {
   try {
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!(await ensureTaskOrganizationAccess(req, task, res))) return;
 
     const isAssignee = task.assignedTo.some(a => a.toString() === req.user.id);
     if (!isAssignee && !isTopAdmin(req.user.role))

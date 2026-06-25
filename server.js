@@ -21,6 +21,7 @@ const tagRoutes = require("./routes/tagRoutes");
 const taskRoutes = require("./routes/taskRoutes");
 const hrRoutes = require("./routes/hrRoutes");
 const organizationRoutes = require("./routes/organizationRoutes");
+const dashboardRoutes = require("./routes/dashboardRoutes");
 const protect = require("./middleware/authMiddleware");
 const requireModule = require("./middleware/moduleMiddleware");
 const notificationRoutes =
@@ -83,6 +84,7 @@ app.use("/api/upload", uploadRoutes);
 app.use("/api", tagRoutes);
 app.use("/api/groups", protect, requireModule("chat"), groupRoutes);
 app.use("/api/organizations", organizationRoutes);
+app.use("/api/dashboard", protect, dashboardRoutes);
 app.use("/api/tasks", protect, requireModule("task"), taskRoutes);
 app.use("/api/hr", protect, hrRoutes);
 app.use(
