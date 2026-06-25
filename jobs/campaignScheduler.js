@@ -547,15 +547,18 @@ async function processCampaigns() {
 
     let recipients = [];
     let groupHandled = false;
+    const contactScope = campaign.organization
+      ? { organization: campaign.organization }
+      : { createdBy: campaign.createdBy?._id || campaign.createdBy };
 
     // ── TAGS ──
     if (campaign.audienceType === "tags") {
-      recipients = await Contact.find({ tags: { $in: campaign.tagIds } });
+      recipients = await Contact.find({ ...contactScope, tags: { $in: campaign.tagIds } });
     }
 
     // ── CONTACTS ──
     else if (campaign.audienceType === "contact") {
-      recipients = await Contact.find({ _id: { $in: campaign.contactIds } });
+      recipients = await Contact.find({ ...contactScope, _id: { $in: campaign.contactIds } });
     }
 
     // ── GROUP — sends ONE message to the group chat directly ──

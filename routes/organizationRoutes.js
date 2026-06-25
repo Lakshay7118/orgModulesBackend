@@ -5,6 +5,7 @@ const allowRoles = require("../middleware/roleMiddleware");
 const Organization = require("../models/Organization");
 const User = require("../models/Users");
 const Contact = require("../models/Contact");
+const Tag = require("../models/Tag");
 const HRDepartment = require("../models/HRDepartment");
 const HRStaff = require("../models/HRStaff");
 const Task = require("../models/Task");
@@ -255,10 +256,17 @@ router.delete("/:id", protect, allowRoles("super_to_super_admin"), async (req, r
 
     const orgUsers = await User.find({ organization: organization._id }).select("_id").lean();
     const orgUserIds = orgUsers.map((user) => user._id);
+    const orgUserIdStrings = orgUserIds.map((id) => id.toString());
     const orgOwnedQuery = {
       $or: [
         { organization: organization._id },
         { organization: null, createdBy: { $in: orgUserIds } },
+      ],
+    };
+    const orgOwnedTagQuery = {
+      $or: [
+        { organization: organization._id },
+        { organization: null, createdBy: { $in: orgUserIdStrings } },
       ],
     };
     const orgTaskIds = await Task.find(orgOwnedQuery).select("_id").lean();
@@ -266,6 +274,7 @@ router.delete("/:id", protect, allowRoles("super_to_super_admin"), async (req, r
     await Promise.all([
       User.deleteMany({ organization: organization._id }),
       Contact.deleteMany(orgOwnedQuery),
+      Tag.deleteMany(orgOwnedTagQuery),
       HRDepartment.deleteMany(orgOwnedQuery),
       HRStaff.deleteMany(orgOwnedQuery),
       Task.deleteMany(orgOwnedQuery),

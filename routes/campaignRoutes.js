@@ -1,6 +1,7 @@
 const express = require("express");
 const Campaign = require("../models/Campaign");
 const Contact = require("../models/Contact");
+const Tag = require("../models/Tag");
 const Notification = require("../models/Notification");
 const User = require("../models/Users");
 const { getIO } = require("../sockets/socket");
@@ -62,6 +63,23 @@ const canAccessTemplate = async (req, template) => {
     return sameId(creator?.organization, req.user.organization);
   }
   return false;
+};
+
+const validateTagsInOrganization = async (req, tagIds = []) => {
+  if (!Array.isArray(tagIds) || tagIds.length === 0 || req.user.role === "super_to_super_admin") return true;
+  if (!req.user.organization) {
+    const count = await Tag.countDocuments({ _id: { $in: tagIds }, createdBy: req.user.id });
+    return count === new Set(tagIds.map(String)).size;
+  }
+  const orgUsers = await organizationUserIds(req.user.organization);
+  const count = await Tag.countDocuments({
+    _id: { $in: tagIds },
+    $or: [
+      { organization: req.user.organization },
+      { organization: null, createdBy: { $in: orgUsers.map((id) => id.toString()) } },
+    ],
+  });
+  return count === new Set(tagIds.map(String)).size;
 };
 
 // ── Shared helpers ───────────────────────────────────────────────
@@ -227,6 +245,9 @@ router.post("/campaigns", protect, allowRoles("super_admin", "manager"), async (
     if (audienceType === "group"   && (!groupIds      || groupIds.length === 0))   return res.status(400).json({ error: "Select at least one group" });
     if (audienceType === "manual"  && (!manualNumbers || manualNumbers.length === 0)) return res.status(400).json({ error: "Enter manual numbers" });
     if (!scheduledDateTime) return res.status(400).json({ error: "scheduledDateTime is required" });
+    if (audienceType === "tags" && !(await validateTagsInOrganization(req, tagIds))) {
+      return res.status(403).json({ error: "Tags must belong to your organization" });
+    }
 
     const scheduledDate = new Date(scheduledDateTime);
     if (isNaN(scheduledDate.getTime())) return res.status(400).json({ error: "Invalid scheduledDateTime" });
@@ -329,6 +350,9 @@ router.put("/campaigns/:id", protect, allowRoles("super_admin", "manager"), asyn
     if (audienceType === "contact" && (!contactIds    || contactIds.length === 0)) return res.status(400).json({ error: "Select at least one contact" });
     if (audienceType === "group"   && (!groupIds      || groupIds.length === 0))   return res.status(400).json({ error: "Select at least one group" });
     if (audienceType === "manual"  && (!manualNumbers || manualNumbers.length === 0)) return res.status(400).json({ error: "Enter manual numbers" });
+    if (audienceType === "tags" && !(await validateTagsInOrganization(req, tagIds))) {
+      return res.status(403).json({ error: "Tags must belong to your organization" });
+    }
 
     let nextRun = existing.nextRun;
     if (scheduledDateTime) {

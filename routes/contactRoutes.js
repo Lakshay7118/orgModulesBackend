@@ -1,6 +1,7 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const Contact = require("../models/Contact");
+const Tag = require("../models/Tag");
 const User = require("../models/Users");
 const Notification = require("../models/Notification");
 const { getIO } = require("../sockets/socket");
@@ -75,6 +76,50 @@ const canAccessContact = async (req, contact) => {
   return false;
 };
 
+const validateTagsInOrganization = async (req, tags = []) => {
+  if (!Array.isArray(tags) || tags.length === 0 || req.user.role === "super_to_super_admin") return true;
+  if (!req.user.organization) {
+    const count = await Tag.countDocuments({ _id: { $in: tags }, createdBy: req.user.id });
+    return count === new Set(tags.map(String)).size;
+  }
+  const orgUsers = await User.find({ organization: req.user.organization }).select("_id").lean();
+  const orgUserIds = orgUsers.map((user) => user._id.toString());
+  const count = await Tag.countDocuments({
+    _id: { $in: tags },
+    $or: [
+      { organization: req.user.organization },
+      { organization: null, createdBy: { $in: orgUserIds } },
+    ],
+  });
+  return count === new Set(tags.map(String)).size;
+};
+
+const filterContactTagsForOrganization = async (req, contacts = []) => {
+  if (req.user.role === "super_to_super_admin") return contacts;
+  const tagScope = req.user.organization
+    ? {
+        $or: [
+          { organization: req.user.organization },
+          {
+            organization: null,
+            createdBy: {
+              $in: (await User.find({ organization: req.user.organization }).select("_id").lean())
+                .map((user) => user._id.toString()),
+            },
+          },
+        ],
+      }
+    : { createdBy: req.user.id };
+  const allowedTagIds = new Set((await Tag.find(tagScope).select("_id").lean()).map((tag) => tag._id.toString()));
+  return contacts.map((contact) => {
+    const plain = typeof contact.toObject === "function" ? contact.toObject() : contact;
+    return {
+      ...plain,
+      tags: (plain.tags || []).filter((tag) => allowedTagIds.has(String(tag?._id || tag))),
+    };
+  });
+};
+
 const hideSystemContacts = (contacts = []) =>
   contacts.filter((contact) => {
     const role = contact.loginUser?.role || contact.role || contact.createdBy?.role || "";
@@ -138,6 +183,7 @@ async function notifyUser({ userId, type, message, contactId }) {
 router.get("/contacts", protect, allowRoles("super_admin", "manager", "hr", "user"), async (req, res) => {
   try {
     const { tag, managerId } = req.query;
+    if (tag && !(await validateTagsInOrganization(req, [tag]))) return res.json([]);
     let filter = {};
     if (isTopAdmin(req.user.role)) { if (managerId) filter.createdBy = managerId; }
     else filter.status = "approved";
@@ -145,7 +191,8 @@ router.get("/contacts", protect, allowRoles("super_admin", "manager", "hr", "use
     filter.role = { $nin: HIDDEN_CONTACT_ROLES };
     filter = await mergeContactFilter(req, filter);
     const contacts = await Contact.find(filter).populate("tags").populate("createdBy", "name phone role");
-    const data = isTopAdmin(req.user.role) ? await attachLoginUsers(contacts) : contacts;
+    const scopedContacts = await filterContactTagsForOrganization(req, contacts);
+    const data = isTopAdmin(req.user.role) ? await attachLoginUsers(scopedContacts) : scopedContacts;
     res.json(hideSystemContacts(data));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -179,6 +226,9 @@ router.post("/contacts", protect, allowRoles("super_admin", "manager", "hr"), as
 
     const existing = await Contact.findOne({ mobile });
     if (existing) return res.status(400).json({ error: "Contact already exists" });
+    if (!(await validateTagsInOrganization(req, tags))) {
+      return res.status(403).json({ error: "Tags must belong to your organization" });
+    }
 
     const status = isTopAdmin(req.user.role) ? "approved" : "pending";
 
@@ -315,6 +365,9 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
     }
     if (req.user.role === "manager" && contact.createdBy.toString() !== req.user.id)
       return res.status(403).json({ error: "Not authorized" });
+    if (tags !== undefined && !(await validateTagsInOrganization(req, tags))) {
+      return res.status(403).json({ error: "Tags must belong to your organization" });
+    }
 
     const wasApproved = contact.status === "approved";
     if (!isTopAdmin(req.user.role)) contact.status = "pending";
