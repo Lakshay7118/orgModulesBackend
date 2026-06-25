@@ -1,5 +1,15 @@
 const mongoose = require("mongoose");
 
+const HRShiftSchema = new mongoose.Schema(
+  {
+    name: { type: String, trim: true, default: "General" },
+    start: { type: String, default: "09:00" },
+    end: { type: String, default: "18:00" },
+    breakMinutes: { type: Number, default: 60, min: 0 },
+  },
+  { _id: true }
+);
+
 const HRDepartmentSchema = new mongoose.Schema(
   {
     name: {
@@ -27,6 +37,10 @@ const HRDepartmentSchema = new mongoose.Schema(
       start: { type: String, default: "09:00" },
       end: { type: String, default: "18:00" },
       breakMinutes: { type: Number, default: 60, min: 0 },
+    },
+    shifts: {
+      type: [HRShiftSchema],
+      default: [],
     },
     leavePolicy: {
       paidLeaves: { type: Number, default: 0, min: 0 },

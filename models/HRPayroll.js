@@ -11,6 +11,12 @@ const HRPayrollSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "HRDepartment",
     },
+    shift: {
+      name: { type: String, trim: true, default: "" },
+      start: { type: String, default: "" },
+      end: { type: String, default: "" },
+      breakMinutes: { type: Number, default: 0, min: 0 },
+    },
     month: {
       type: String,
       required: true,

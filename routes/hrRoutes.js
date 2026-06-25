@@ -42,6 +42,61 @@ const normalizeLeavePolicy = (policy = {}) => ({
   paidLeaves: Math.max(0, toNumber(policy.paidLeaves, 0)),
   shortLeaves: Math.max(0, toNumber(policy.shortLeaves, 0)),
 });
+const shiftDurationHours = (shift = {}) => {
+  const start = timeToMinutes(shift.start);
+  const end = timeToMinutes(shift.end);
+  if (start === null || end === null) return 8;
+  const adjustedEnd = end < start ? end + 24 * 60 : end;
+  const workMinutes = Math.max(0, adjustedEnd - start - Math.max(0, toNumber(shift.breakMinutes, 0)));
+  return Math.round((workMinutes / 60) * 100) / 100;
+};
+const normalizeShift = (shift = {}, fallback = {}) => ({
+  name: optionalString(shift.name || fallback.name || "General") || "General",
+  start: shift.start || fallback.start || "09:00",
+  end: shift.end || fallback.end || "18:00",
+  breakMinutes: Math.max(0, toNumber(shift.breakMinutes ?? fallback.breakMinutes, 60)),
+});
+const normalizeDepartmentShifts = (body = {}) => {
+  const source = Array.isArray(body.shifts) && body.shifts.length ? body.shifts : [body.shift || {}];
+  const shifts = source.map((shift, index) => normalizeShift(shift, index === 0 ? { name: "General" } : {}));
+  return shifts.length ? shifts : [normalizeShift()];
+};
+const departmentShifts = (department = {}) => {
+  const shifts = Array.isArray(department.shifts) && department.shifts.length
+    ? department.shifts
+    : [department.shift || {}];
+  return shifts.map((shift) => ({
+    _id: shift._id,
+    ...normalizeShift(shift),
+  }));
+};
+const resolveStaffShift = (staff = {}) => {
+  if (staff.shift?.start || staff.shift?.end) return normalizeShift(staff.shift);
+  const shifts = departmentShifts(staff.department || {});
+  if (staff.shiftId) {
+    const selected = shifts.find((shift) => sameId(shift._id, staff.shiftId));
+    if (selected) return selected;
+  }
+  return shifts[0] || normalizeShift();
+};
+const resolveShiftSelection = async (department, shiftId) => {
+  if (!department) return { shiftId: null, shift: {} };
+  const shifts = departmentShifts(department);
+  const fallbackIndex = String(shiftId || "").startsWith("shift-")
+    ? Number(String(shiftId).replace("shift-", ""))
+    : null;
+  const selected = Number.isInteger(fallbackIndex)
+    ? shifts[fallbackIndex]
+    : shiftId
+      ? shifts.find((shift) => sameId(shift._id, shiftId))
+      : shifts[0];
+  if (!selected) {
+    const error = new Error("Selected shift is not available in this department.");
+    error.statusCode = 400;
+    throw error;
+  }
+  return { shiftId: selected._id || null, shift: normalizeShift(selected) };
+};
 const normalizeSalaryBasis = (basis) => {
   if (basis === "weekly") return "daily";
   return ["monthly", "daily", "hourly"].includes(basis) ? basis : "monthly";
@@ -246,7 +301,7 @@ const buildPeriodFromDueDate = (dueDate, cycleStartDay = 1) => {
     cycleStartDay: safeCycleDay,
     periodStart: formatUTCDate(periodStart),
     periodEnd: formatUTCDate(periodEnd),
-    month: formatUTCDate(periodEnd).slice(0, 7),
+    month: formatUTCDate(periodStart).slice(0, 7),
   };
 };
 const isStaffPayrollDueOnDate = (staff, dueDate) => {
@@ -468,7 +523,8 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
   const offDays = normalizeOffDays(department.weeklyOffDays || []);
   const leavePolicy = normalizeLeavePolicy(department.leavePolicy);
   const salaryBasis = normalizeSalaryBasis(staff.salaryBasis);
-  const expectedHoursPerDay = Math.max(0, Number(staff.expectedHoursPerDay || 0)) || 8;
+  const staffShift = resolveStaffShift(staff);
+  const expectedHoursPerDay = Math.max(0, Number(staff.expectedHoursPerDay || 0)) || shiftDurationHours(staffShift) || 8;
   const joinDate = dateOnly(staff.joinDate);
   const attendanceStart = period.attendanceStart || period.periodStart;
   const attendanceEnd = period.attendanceEnd || period.periodEnd;
@@ -657,6 +713,7 @@ async function buildPayrollForStaff(staff, period, generatedBy, existingPayroll 
   return {
     staff: staff._id,
     department: staff.department?._id || staff.department || null,
+    shift: staffShift,
     month: period.month,
     cycleStartDay: period.cycleStartDay,
     periodStart: period.periodStart,
@@ -958,16 +1015,13 @@ router.get("/departments", async (req, res) => {
 
 router.post("/departments", async (req, res) => {
   try {
+    const shifts = normalizeDepartmentShifts(req.body);
     const department = await HRDepartment.create({
       name: req.body.name,
       description: req.body.description || "",
       weeklyOffDays: normalizeOffDays(req.body.weeklyOffDays),
-      shift: {
-        name: req.body.shift?.name || "General",
-        start: req.body.shift?.start || "09:00",
-        end: req.body.shift?.end || "18:00",
-        breakMinutes: toNumber(req.body.shift?.breakMinutes, 60),
-      },
+      shift: shifts[0],
+      shifts,
       leavePolicy: normalizeLeavePolicy(req.body.leavePolicy),
       createdBy: req.user.id,
       organization: req.user.organization || null,
@@ -992,13 +1046,10 @@ router.patch("/departments/:id", async (req, res) => {
     });
     if (req.body.weeklyOffDays !== undefined) updates.weeklyOffDays = normalizeOffDays(req.body.weeklyOffDays);
     if (req.body.leavePolicy !== undefined) updates.leavePolicy = normalizeLeavePolicy(req.body.leavePolicy);
-    if (req.body.shift) {
-      updates.shift = {
-        name: req.body.shift.name || "General",
-        start: req.body.shift.start || "09:00",
-        end: req.body.shift.end || "18:00",
-        breakMinutes: toNumber(req.body.shift.breakMinutes, 60),
-      };
+    if (req.body.shifts || req.body.shift) {
+      const shifts = normalizeDepartmentShifts(req.body);
+      updates.shift = shifts[0];
+      updates.shifts = shifts;
     }
 
     const department = await HRDepartment.findByIdAndUpdate(req.params.id, updates, {
@@ -1137,7 +1188,11 @@ router.post("/contact-staff", requireHrPermission("canAddStaff"), async (req, re
     }
 
     const department = staffInput.department || null;
-    if (department) await ensureDepartmentAccess(req, department);
+    const departmentDoc = department ? await ensureDepartmentAccess(req, department) : null;
+    const shiftSelection = await resolveShiftSelection(departmentDoc, staffInput.shiftId);
+    const expectedHoursPerDay = staffInput.expectedHoursPerDay !== undefined
+      ? toNumber(staffInput.expectedHoursPerDay, shiftDurationHours(shiftSelection.shift))
+      : shiftDurationHours(shiftSelection.shift);
 
     const staff = await HRStaff.create({
       employeeCode: String(staffInput.employeeCode || "").trim() || undefined,
@@ -1152,10 +1207,12 @@ router.post("/contact-staff", requireHrPermission("canAddStaff"), async (req, re
       branch: optionalString(staffInput.branch),
       upiId: optionalString(staffInput.upiId),
       department,
+      shiftId: shiftSelection.shiftId,
+      shift: shiftSelection.shift,
       designation: staffInput.designation || "",
       monthlySalary: money(staffInput.monthlySalary),
       salaryBasis: normalizeSalaryBasis(staffInput.salaryBasis),
-      expectedHoursPerDay: toNumber(staffInput.expectedHoursPerDay, 8),
+      expectedHoursPerDay,
       payrollCycleDay: normalizeCycleDay(
         staffInput.payrollCycleDay,
         cycleDayFromDate(staffInput.joinDate, 1)
@@ -1192,7 +1249,11 @@ router.post("/staff", requireHrPermission("canAddStaff"), async (req, res) => {
     const department = req.body.department || null;
 
     if (!name) return res.status(400).json({ error: "Staff name is required." });
-    if (department) await ensureDepartmentAccess(req, department);
+    const departmentDoc = department ? await ensureDepartmentAccess(req, department) : null;
+    const shiftSelection = await resolveShiftSelection(departmentDoc, req.body.shiftId);
+    const expectedHoursPerDay = req.body.expectedHoursPerDay !== undefined
+      ? toNumber(req.body.expectedHoursPerDay, shiftDurationHours(shiftSelection.shift))
+      : shiftDurationHours(shiftSelection.shift);
 
     const staff = await HRStaff.create({
       employeeCode: String(req.body.employeeCode || "").trim() || undefined,
@@ -1207,10 +1268,12 @@ router.post("/staff", requireHrPermission("canAddStaff"), async (req, res) => {
       branch: optionalString(req.body.branch),
       upiId: optionalString(req.body.upiId),
       department,
+      shiftId: shiftSelection.shiftId,
+      shift: shiftSelection.shift,
       designation: req.body.designation || "",
       monthlySalary: money(req.body.monthlySalary),
       salaryBasis: normalizeSalaryBasis(req.body.salaryBasis),
-      expectedHoursPerDay: toNumber(req.body.expectedHoursPerDay, 8),
+      expectedHoursPerDay,
       payrollCycleDay: normalizeCycleDay(
         req.body.payrollCycleDay,
         cycleDayFromDate(req.body.joinDate, 1)
@@ -1249,6 +1312,7 @@ router.patch("/staff/:id", requireHrPermission("canEditStaff"), async (req, res)
       "branch",
       "upiId",
       "department",
+      "shiftId",
       "designation",
       "salaryBasis",
       "payrollCycleDay",
@@ -1265,7 +1329,16 @@ router.patch("/staff/:id", requireHrPermission("canEditStaff"), async (req, res)
     if (updates.email) updates.email = updates.email.toLowerCase();
     if (updates.address !== undefined) updates.address = normalizeStaffAddress(updates.address);
     if (updates.ifscCode !== undefined) updates.ifscCode = optionalUpperString(updates.ifscCode);
-    if (updates.department) await ensureDepartmentAccess(req, updates.department);
+    const effectiveDepartment = updates.department !== undefined ? updates.department : existing.department;
+    const departmentDoc = effectiveDepartment ? await ensureDepartmentAccess(req, effectiveDepartment) : null;
+    if (req.body.shiftId !== undefined || updates.department !== undefined) {
+      const shiftSelection = await resolveShiftSelection(departmentDoc, req.body.shiftId || null);
+      updates.shiftId = shiftSelection.shiftId;
+      updates.shift = shiftSelection.shift;
+      if (req.body.expectedHoursPerDay === undefined) {
+        updates.expectedHoursPerDay = shiftDurationHours(shiftSelection.shift);
+      }
+    }
     if (req.body.salaryBasis !== undefined) updates.salaryBasis = normalizeSalaryBasis(req.body.salaryBasis);
     if (req.body.payrollCycleDay !== undefined) updates.payrollCycleDay = normalizeCycleDay(req.body.payrollCycleDay);
     if (req.body.monthlySalary !== undefined) updates.monthlySalary = money(req.body.monthlySalary);
@@ -1818,14 +1891,15 @@ router.post("/payroll/generate", requireHrPermission("canGenerateSalarySlip"), a
   try {
     await syncPayrollIndexes();
 
-    const setting = await getPayrollSetting();
-    const fallbackCycleStartDay = normalizeCycleDay(req.body.cycleStartDay || setting.cycleStartDay);
-    const dueDate = req.body.dueDate || (
-      req.body.month && validMonth(req.body.month)
-        ? `${req.body.month}-${String(fallbackCycleStartDay).padStart(2, "0")}`
-        : ""
-    );
-    if (!validDate(dueDate)) return res.status(400).json({ error: "dueDate must be in YYYY-MM-DD format" });
+    const requestedSalaryMonth = validMonth(req.body.salaryMonth)
+      ? req.body.salaryMonth
+      : validMonth(req.body.month)
+        ? req.body.month
+        : "";
+    const dueDate = req.body.dueDate || "";
+    if (!requestedSalaryMonth && !validDate(dueDate)) {
+      return res.status(400).json({ error: "dueDate must be in YYYY-MM-DD format" });
+    }
 
     const requestedSalaryBasis = req.body.salaryBasis ? normalizeSalaryBasis(req.body.salaryBasis) : null;
     const filter = { status: "active" };
@@ -1833,7 +1907,10 @@ router.post("/payroll/generate", requireHrPermission("canGenerateSalarySlip"), a
     if (req.body.staff) filter._id = req.body.staff;
 
     const staffList = await HRStaff.find(filter).populate("department");
-    if (req.body.staff && staffList[0] && !isStaffPayrollDueOnDate(staffList[0], dueDate)) {
+    const dueDateForStaff = (staff) => requestedSalaryMonth
+      ? payrollDueDateForSalaryMonth(staff, requestedSalaryMonth)
+      : dueDate;
+    if (req.body.staff && staffList[0] && !isStaffPayrollDueOnDate(staffList[0], dueDateForStaff(staffList[0]))) {
       return res.status(400).json({
         error: "This staff does not have payroll due on the selected date.",
       });
@@ -1841,8 +1918,9 @@ router.post("/payroll/generate", requireHrPermission("canGenerateSalarySlip"), a
     const results = [];
 
     for (const staff of staffList) {
-      if (!isStaffPayrollDueOnDate(staff, dueDate)) continue;
-      const period = buildPeriodForStaff(staff, dueDate);
+      const staffDueDate = dueDateForStaff(staff);
+      if (!isStaffPayrollDueOnDate(staff, staffDueDate)) continue;
+      const period = buildPeriodForStaff(staff, staffDueDate);
       const existing = await HRPayroll.findOne({ staff: staff._id, periodEnd: period.periodEnd });
 
       const payrollData = await buildPayrollForStaff(staff, period, req.user.id, existing);

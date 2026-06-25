@@ -92,6 +92,16 @@ const HRStaffSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "HRDepartment",
     },
+    shiftId: {
+      type: mongoose.Schema.Types.ObjectId,
+      default: null,
+    },
+    shift: {
+      name: { type: String, trim: true, default: "" },
+      start: { type: String, default: "" },
+      end: { type: String, default: "" },
+      breakMinutes: { type: Number, default: 0, min: 0 },
+    },
     designation: {
       type: String,
       trim: true,
