@@ -12,7 +12,7 @@ const generateToken = require("../utils/generateToken");
 const router = express.Router();
 
 const MODULES = ["hr", "task", "chat"];
-const SUPER_ADMIN_SELECT = "name phone email password role allowedModules isActive";
+const SUPER_ADMIN_SELECT = "name phone email role allowedModules isActive";
 
 const cleanModules = (modules = []) => {
   if (!Array.isArray(modules)) return [];
@@ -101,7 +101,6 @@ router.post("/", protect, allowRoles("super_to_super_admin"), async (req, res) =
           name: superAdmin.name,
           phone: superAdmin.phone,
           email: superAdmin.email,
-          password: superAdmin.password,
           role: superAdmin.role,
           organization: superAdmin.organization,
           allowedModules: superAdmin.allowedModules,
@@ -116,10 +115,13 @@ router.post("/", protect, allowRoles("super_to_super_admin"), async (req, res) =
 
 router.put("/:id", protect, allowRoles("super_to_super_admin"), async (req, res) => {
   try {
-    const { organizationName, allowedModules, isActive } = req.body;
+    const { organizationName, superAdminName, superAdminPhone, allowedModules, isActive } = req.body;
 
     if (!organizationName?.trim()) {
       return res.status(400).json({ error: "Organization name is required" });
+    }
+    if (superAdminPhone && !/^\d{6,15}$/.test(String(superAdminPhone).trim())) {
+      return res.status(400).json({ error: "Enter a valid super admin phone number" });
     }
 
     const modules = cleanModules(allowedModules);
@@ -134,6 +136,26 @@ router.put("/:id", protect, allowRoles("super_to_super_admin"), async (req, res)
     organization.allowedModules = modules;
     if (typeof isActive === "boolean") organization.isActive = isActive;
     await organization.save();
+
+    if (organization.superAdmin && (superAdminName !== undefined || superAdminPhone !== undefined)) {
+      const superAdminUpdates = {};
+      if (superAdminName !== undefined) {
+        superAdminUpdates.name = String(superAdminName || "").trim() || organization.name;
+      }
+      if (superAdminPhone !== undefined) {
+        const phone = String(superAdminPhone || "").trim();
+        if (phone) {
+          const existingPhone = await User.findOne({ phone, _id: { $ne: organization.superAdmin } });
+          if (existingPhone) return res.status(400).json({ error: "Super admin phone already exists" });
+          superAdminUpdates.phone = phone;
+        } else {
+          superAdminUpdates.$unset = { phone: "" };
+        }
+      }
+      if (Object.keys(superAdminUpdates).length) {
+        await User.findByIdAndUpdate(organization.superAdmin, superAdminUpdates, { runValidators: true });
+      }
+    }
 
     await User.updateMany(
       { organization: organization._id },
