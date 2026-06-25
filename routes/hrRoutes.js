@@ -6,6 +6,7 @@ const router = express.Router();
 const Contact = require("../models/Contact");
 const HRDepartment = require("../models/HRDepartment");
 const HRStaff = require("../models/HRStaff");
+const Organization = require("../models/Organization");
 const HRBank = require("../models/HRBank");
 const HRBankTransaction = require("../models/HRBankTransaction");
 const HRAttendance = require("../models/HRAttendance");
@@ -331,6 +332,35 @@ const payrollCanDeductLoan = (loan, period, salaryBasis) => {
 };
 
 const populateStaff = (query) => query.populate("department").sort({ createdAt: -1 });
+const SUPER_ADMIN_SELECT = "name phone email password role allowedModules isActive organization";
+const attachDepartmentSuperAdmins = async (departments) => {
+  const isList = Array.isArray(departments);
+  const plainDepartments = (isList ? departments : [departments]).filter(Boolean).map((department) =>
+    department.toObject ? department.toObject() : department
+  );
+  const organizationIds = [...new Set(plainDepartments.map((department) => idOfDoc(department.organization)).filter(Boolean))];
+  const creatorIds = [...new Set(plainDepartments.map((department) => idOfDoc(department.createdBy)).filter(Boolean))];
+
+  const [organizations, creators] = await Promise.all([
+    organizationIds.length
+      ? Organization.find({ _id: { $in: organizationIds } }).populate("superAdmin", SUPER_ADMIN_SELECT).lean()
+      : [],
+    creatorIds.length ? User.find({ _id: { $in: creatorIds } }).select(SUPER_ADMIN_SELECT).lean() : [],
+  ]);
+  const organizationById = new Map(organizations.map((organization) => [idOfDoc(organization._id), organization]));
+  const creatorById = new Map(creators.map((creator) => [idOfDoc(creator._id), creator]));
+
+  const withSuperAdmins = plainDepartments.map((department) => {
+    const organization = organizationById.get(idOfDoc(department.organization));
+    const creator = creatorById.get(idOfDoc(department.createdBy));
+    return {
+      ...department,
+      superAdmin: organization?.superAdmin || (creator?.role === "super_admin" ? creator : null),
+    };
+  });
+
+  return isList ? withSuperAdmins : withSuperAdmins[0];
+};
 const populatePayroll = (query) =>
   query
     .populate("staff")
@@ -920,7 +950,7 @@ router.patch("/payroll/settings", async (req, res) => {
 router.get("/departments", async (req, res) => {
   try {
     const departments = await HRDepartment.find(await mergeDepartmentScope(req)).sort({ name: 1 });
-    res.json({ success: true, data: departments });
+    res.json({ success: true, data: await attachDepartmentSuperAdmins(departments) });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -942,7 +972,7 @@ router.post("/departments", async (req, res) => {
       createdBy: req.user.id,
       organization: req.user.organization || null,
     });
-    res.status(201).json({ success: true, data: department });
+    res.status(201).json({ success: true, data: await attachDepartmentSuperAdmins(department) });
   } catch (error) {
     sendHrError(res, error, "Could not save department.");
   }
@@ -976,7 +1006,7 @@ router.patch("/departments/:id", async (req, res) => {
       runValidators: true,
     });
     if (!department) return res.status(404).json({ error: "Department not found" });
-    res.json({ success: true, data: department });
+    res.json({ success: true, data: await attachDepartmentSuperAdmins(department) });
   } catch (error) {
     sendHrError(res, error, "Could not update department.");
   }
