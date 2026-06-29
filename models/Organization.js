@@ -7,6 +7,11 @@ const OrganizationSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
+    logoUrl: {
+      type: String,
+      trim: true,
+      default: "",
+    },
     allowedModules: {
       type: [String],
       enum: ["hr", "task", "chat"],

@@ -111,9 +111,9 @@ const notifySupportStaff = async (payload, { organization, requesterRole } = {})
   return notifications;
 };
 
-const buildProfileChanges = (currentUser, body) => {
+const buildProfileChanges = (currentUser, body, organization = null) => {
   const allowedFields = ["name", "email", "phone"];
-  return allowedFields
+  const profileChanges = allowedFields
     .filter((field) => Object.prototype.hasOwnProperty.call(body, field))
     .map((field) => ({
       field,
@@ -121,6 +121,39 @@ const buildProfileChanges = (currentUser, body) => {
       to: typeof body[field] === "string" ? body[field].trim() : body[field],
     }))
     .filter((change) => String(change.from || "") !== String(change.to || ""));
+
+  const organizationChanges = [];
+  if (organization && Object.prototype.hasOwnProperty.call(body, "organizationName")) {
+    organizationChanges.push({
+      field: "organizationName",
+      from: organization.name || "",
+      to: typeof body.organizationName === "string" ? body.organizationName.trim() : body.organizationName,
+    });
+  }
+  if (organization && Object.prototype.hasOwnProperty.call(body, "organizationLogoUrl")) {
+    organizationChanges.push({
+      field: "organizationLogoUrl",
+      from: organization.logoUrl || "",
+      to: typeof body.organizationLogoUrl === "string" ? body.organizationLogoUrl.trim() : body.organizationLogoUrl,
+    });
+  }
+
+  return [...profileChanges, ...organizationChanges]
+    .filter((change) => String(change.from || "") !== String(change.to || ""));
+};
+
+const userPayloadWithOrganization = async (userId) => {
+  const user = await User.findById(userId)
+    .select(PUBLIC_USER_FIELDS)
+    .populate("organization", "name logoUrl")
+    .lean();
+  if (!user) return null;
+  return {
+    ...user,
+    organizationName: user.organization?.name || "",
+    organizationLogoUrl: user.organization?.logoUrl || "",
+    organization: user.organization?._id || user.organization,
+  };
 };
 
 
@@ -165,7 +198,7 @@ router.post("/login", async (req, res) => {
     }
 
     const organization = user.organization
-      ? await Organization.findById(user.organization).select("name").lean()
+      ? await Organization.findById(user.organization).select("name logoUrl").lean()
       : null;
     const token = generateToken(user);
 
@@ -179,6 +212,7 @@ router.post("/login", async (req, res) => {
         role: user.role,
         organization: user.organization,
         organizationName: organization?.name || "",
+        organizationLogoUrl: organization?.logoUrl || "",
         allowedModules: user.allowedModules || [],
         hrPermissions: user.hrPermissions || {},
         isActive: user.isActive !== false,
@@ -214,7 +248,7 @@ router.get("/me", protect, async (req, res) => {
   try {
     const user = await User.findById(req.user.id)
       .select(PUBLIC_USER_FIELDS)
-      .populate("organization", "name")
+      .populate("organization", "name logoUrl")
       .lean();
     if (!user) return res.status(404).json({ error: "User not found" });
     res.json({
@@ -222,6 +256,7 @@ router.get("/me", protect, async (req, res) => {
       data: {
         ...user,
         organizationName: user.organization?.name || "",
+        organizationLogoUrl: user.organization?.logoUrl || "",
         organization: user.organization?._id || user.organization,
       },
     });
@@ -240,7 +275,10 @@ router.patch("/me", protect, async (req, res) => {
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    const changes = buildProfileChanges(user, req.body);
+    const organization = user.organization
+      ? await Organization.findById(user.organization).select("name logoUrl")
+      : null;
+    const changes = buildProfileChanges(user, req.body, organization);
     if (changes.length === 0) {
       return res.json({ success: true, status: "unchanged", data: user });
     }
@@ -265,12 +303,21 @@ router.patch("/me", protect, async (req, res) => {
 
     if (["super_to_super_admin", "super_admin"].includes(user.role)) {
       changes.forEach((change) => {
+        if (change.field === "organizationName" && organization) {
+          organization.name = change.to || organization.name;
+          return;
+        }
+        if (change.field === "organizationLogoUrl" && organization) {
+          organization.logoUrl = change.to || "";
+          return;
+        }
         user[change.field] = change.field === "email" && change.to
           ? String(change.to).toLowerCase()
           : change.to;
       });
       await user.save();
-      const safeUser = await User.findById(user._id).select(PUBLIC_USER_FIELDS).lean();
+      if (organization?.isModified?.()) await organization.save();
+      const safeUser = await userPayloadWithOrganization(user._id);
       return res.json({ success: true, status: "approved", data: safeUser });
     }
 
@@ -361,12 +408,24 @@ router.patch(
       }
 
       if (status === "approved") {
+        const organization = request.requester.organization
+          ? await Organization.findById(request.requester.organization)
+          : null;
         request.changes.forEach((change) => {
+          if (change.field === "organizationName" && organization) {
+            organization.name = change.to || organization.name;
+            return;
+          }
+          if (change.field === "organizationLogoUrl" && organization) {
+            organization.logoUrl = change.to || "";
+            return;
+          }
           request.requester[change.field] = change.field === "email" && change.to
             ? String(change.to).toLowerCase()
             : change.to;
         });
         await request.requester.save();
+        if (organization?.isModified?.()) await organization.save();
       }
 
       request.status = status;

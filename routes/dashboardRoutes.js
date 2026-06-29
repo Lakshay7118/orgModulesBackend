@@ -10,14 +10,15 @@ const HRLoan = require("../models/HRLoan");
 const HRPayroll = require("../models/HRPayroll");
 const HRStaff = require("../models/HRStaff");
 const Message = require("../models/Message");
+const Notification = require("../models/Notification");
 const Organization = require("../models/Organization");
 const Task = require("../models/Task");
 const Template = require("../models/Template");
 const User = require("../models/Users");
 
-const topAdminRoles = ["super_to_super_admin", "super_admin"];
-const sameId = (left, right) => left && right && String(left) === String(right);
+const fullDashboardRoles = ["super_to_super_admin", "super_admin", "manager"];
 const money = (value) => Math.max(0, Math.round((Number(value) || 0) * 100) / 100);
+const hasFullDashboardAccess = (role) => fullDashboardRoles.includes(role);
 
 const organizationUserIds = async (organization) => {
   if (!organization) return [];
@@ -34,12 +35,14 @@ const orgOwnedScope = (organization, orgUserIds) => ({
 
 const scopedUserFilter = (req) => {
   if (req.user.role === "super_to_super_admin") return {};
+  if (!hasFullDashboardAccess(req.user.role)) return { _id: req.user.id };
   if (req.user.organization) return { organization: req.user.organization };
   return { createdBy: req.user.id };
 };
 
 const scopedCreatedFilter = async (req, filter = {}) => {
   if (req.user.role === "super_to_super_admin") return filter;
+  if (!hasFullDashboardAccess(req.user.role)) return { $and: [{ createdBy: req.user.id }, filter] };
   if (!req.user.organization) return { $and: [{ createdBy: req.user.id }, filter] };
   const orgUserIds = await organizationUserIds(req.user.organization);
   return { $and: [orgOwnedScope(req.user.organization, orgUserIds), filter] };
@@ -72,13 +75,35 @@ const scopedTaskFilter = async (req, filter = {}) => {
 
 const scopedHrFilter = async (req, filter = {}) => {
   if (req.user.role === "super_to_super_admin") return filter;
+  if (!hasFullDashboardAccess(req.user.role)) return { $and: [{ createdBy: req.user.id }, filter] };
   if (!req.user.organization) return { $and: [{ createdBy: req.user.id }, filter] };
   const orgUserIds = await organizationUserIds(req.user.organization);
   return { $and: [orgOwnedScope(req.user.organization, orgUserIds), filter] };
 };
 
+const scopedStaffFilter = async (req, filter = {}) => {
+  if (hasFullDashboardAccess(req.user.role)) return scopedHrFilter(req, filter);
+
+  const selfFilters = [{ createdBy: req.user.id }];
+  if (req.user.email) selfFilters.push({ email: req.user.email });
+  if (req.user.phone) selfFilters.push({ phone: req.user.phone });
+
+  return { $and: [{ $or: selfFilters }, filter] };
+};
+
+const scopedStaffLinkedFilter = async (req, field, filter = {}) => {
+  if (hasFullDashboardAccess(req.user.role)) return scopedCreatorFilter(req, field, filter);
+
+  const staffScope = await scopedStaffFilter(req);
+  const staffIds = (await HRStaff.find(staffScope).select("_id").lean()).map((staff) => staff._id);
+  if (!staffIds.length) return { _id: null };
+
+  return { $and: [{ staff: { $in: staffIds } }, filter] };
+};
+
 const scopedCreatorFilter = async (req, field, filter = {}) => {
   if (req.user.role === "super_to_super_admin") return filter;
+  if (!hasFullDashboardAccess(req.user.role)) return { $and: [{ [field]: req.user.id }, filter] };
   if (!req.user.organization) return { $and: [{ [field]: req.user.id }, filter] };
   const orgUserIds = await organizationUserIds(req.user.organization);
   return { $and: [{ [field]: { $in: orgUserIds } }, filter] };
@@ -95,6 +120,22 @@ const addActivity = (items, type, title, description, date, href) => {
   });
 };
 
+const taskActivityTypes = [
+  "task_assigned",
+  "response_received",
+  "approval_requested",
+  "task_approved",
+  "task_rejected",
+];
+
+const taskActivityMeta = {
+  task_assigned: { type: "task", title: "Task assigned" },
+  response_received: { type: "message", title: "Task reply received" },
+  approval_requested: { type: "task", title: "Task approval requested" },
+  task_approved: { type: "task", title: "Task approved" },
+  task_rejected: { type: "task", title: "Task rejected" },
+};
+
 router.get("/summary", async (req, res) => {
   try {
     const now = new Date();
@@ -104,11 +145,11 @@ router.get("/summary", async (req, res) => {
       scopedCreatedFilter(req),
       scopedCreatedFilter(req),
       scopedCreatedFilter(req),
-      scopedHrFilter(req, { status: "active" }),
+      scopedStaffFilter(req, { status: "active" }),
       scopedHrFilter(req),
       scopedCreatorFilter(req, "createdBy"),
-      scopedCreatorFilter(req, "createdBy", { category: "advance", status: "active", outstanding: { $gt: 0 } }),
-      scopedCreatorFilter(req, "generatedBy", { status: { $in: ["draft", "partial"] } }),
+      scopedStaffLinkedFilter(req, "createdBy", { category: "advance", status: "active", outstanding: { $gt: 0 } }),
+      scopedStaffLinkedFilter(req, "generatedBy", { status: { $in: ["draft", "partial"] } }),
     ]);
 
     const userFilter = scopedUserFilter(req);
@@ -147,11 +188,8 @@ router.get("/summary", async (req, res) => {
       banks,
       activeLoans,
       unpaidPayrolls,
-      recentTasks,
-      recentTemplates,
-      recentCampaigns,
-      recentContacts,
-      recentMessages,
+      recentTaskNotifications,
+      recentAssignedTasks,
     ] = await Promise.all([
       User.countDocuments(userFilter),
       Contact.countDocuments(contactScope),
@@ -172,33 +210,45 @@ router.get("/summary", async (req, res) => {
       HRBank.find(bankScope).select("balance").lean(),
       HRLoan.find(loanScope).select("outstanding").lean(),
       HRPayroll.find(payrollScope).select("balanceDue netPay").lean(),
-      Task.find(taskScope).select("title status dueDate createdAt updatedAt").sort({ updatedAt: -1 }).limit(4).lean(),
-      Template.find(templateScope).select("name status approvalStatus createdAt updatedAt").sort({ updatedAt: -1 }).limit(3).lean(),
-      Campaign.find(campaignScope).select("campaignName status sentCount createdAt updatedAt").sort({ updatedAt: -1 }).limit(3).lean(),
-      Contact.find(contactScope).select("name mobile createdAt updatedAt").sort({ createdAt: -1 }).limit(3).lean(),
-      Message.find(messageScope).select("text messageType sender createdAt").sort({ createdAt: -1 }).limit(3).lean(),
+      Notification.find({ userId: req.user.id, type: { $in: taskActivityTypes } })
+        .select("type message taskId createdAt")
+        .sort({ createdAt: -1 })
+        .limit(8)
+        .lean(),
+      Task.find({ $and: [taskScope, { assignedTo: req.user.id }] })
+        .select("title createdAt")
+        .sort({ createdAt: -1 })
+        .limit(4)
+        .lean(),
     ]);
 
     const bankBalance = money(banks.reduce((sum, bank) => sum + Number(bank.balance || 0), 0));
     const loanOutstanding = money(activeLoans.reduce((sum, loan) => sum + Number(loan.outstanding || 0), 0));
     const salaryDues = money(unpaidPayrolls.reduce((sum, payroll) => sum + Number(payroll.balanceDue ?? payroll.netPay ?? 0), 0));
     const activities = [];
+    const recentCampaigns = [];
+    const recentContacts = [];
+    const recentMessages = [];
 
-    recentTasks.forEach((task) => addActivity(
+    recentTaskNotifications.forEach((notification) => {
+      const meta = taskActivityMeta[notification.type] || { type: "task", title: "Task activity" };
+      addActivity(
+        activities,
+        meta.type,
+        meta.title,
+        notification.message || "Task activity",
+        notification.createdAt,
+        notification.taskId ? `/task?taskId=${notification.taskId}` : "/task"
+      );
+    });
+
+    recentAssignedTasks.forEach((task) => addActivity(
       activities,
       "task",
-      task.title || "Task updated",
-      `Status: ${String(task.status || "pending").replace("_", " ")}`,
-      task.updatedAt || task.createdAt,
+      "Task assigned",
+      task.title || "A task was assigned",
+      task.createdAt,
       "/task"
-    ));
-    recentTemplates.forEach((template) => addActivity(
-      activities,
-      "template",
-      template.name || "Template updated",
-      `Template ${String(template.approvalStatus || template.status || "updated").replace("_", " ")}`,
-      template.updatedAt || template.createdAt,
-      "/Template"
     ));
     recentCampaigns.forEach((campaign) => addActivity(
       activities,
@@ -226,6 +276,9 @@ router.get("/summary", async (req, res) => {
     ));
 
     activities.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+    const organizationProfile = req.user.organization
+      ? await Organization.findById(req.user.organization).select("name logoUrl").lean()
+      : null;
 
     res.json({
       success: true,
@@ -236,6 +289,13 @@ router.get("/summary", async (req, res) => {
           phone: req.user.phone || "",
           role: req.user.role || "",
           allowedModules: req.user.allowedModules || [],
+          organization: organizationProfile
+            ? {
+                id: organizationProfile._id,
+                name: organizationProfile.name || "",
+                logoUrl: organizationProfile.logoUrl || "",
+              }
+            : null,
         },
         metrics: {
           users: userCount,

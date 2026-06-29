@@ -47,6 +47,7 @@ router.post("/", protect, allowRoles("super_to_super_admin"), async (req, res) =
       superAdminEmail,
       superAdminPassword,
       allowedModules,
+      logoUrl,
     } = req.body;
 
     if (!organizationName?.trim()) {
@@ -75,6 +76,7 @@ router.post("/", protect, allowRoles("super_to_super_admin"), async (req, res) =
 
     const organization = await Organization.create({
       name: organizationName.trim(),
+      logoUrl: String(logoUrl || "").trim(),
       allowedModules: modules,
       createdBy: req.user.id,
     });
@@ -118,7 +120,7 @@ router.post("/", protect, allowRoles("super_to_super_admin"), async (req, res) =
 
 router.put("/:id", protect, allowRoles("super_to_super_admin"), async (req, res) => {
   try {
-    const { organizationName, superAdminName, superAdminPhone, allowedModules, isActive } = req.body;
+    const { organizationName, superAdminName, superAdminPhone, allowedModules, isActive, logoUrl } = req.body;
 
     if (!organizationName?.trim()) {
       return res.status(400).json({ error: "Organization name is required" });
@@ -136,6 +138,7 @@ router.put("/:id", protect, allowRoles("super_to_super_admin"), async (req, res)
     if (!organization) return res.status(404).json({ error: "Organization not found" });
 
     organization.name = organizationName.trim();
+    organization.logoUrl = String(logoUrl || "").trim();
     organization.allowedModules = modules;
     if (typeof isActive === "boolean") organization.isActive = isActive;
     await organization.save();
