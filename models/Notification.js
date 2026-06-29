@@ -37,16 +37,11 @@ const NotificationSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-NotificationSchema.pre("validate", async function assignRecipientOrganization(next) {
-  try {
-    if (!this.organization && this.userId) {
-      const User = require("./Users");
-      const user = await User.findById(this.userId).select("organization").lean();
-      this.organization = user?.organization || null;
-    }
-    next();
-  } catch (error) {
-    next(error);
+NotificationSchema.pre("validate", async function assignRecipientOrganization() {
+  if (!this.organization && this.userId) {
+    const User = require("./Users");
+    const user = await User.findById(this.userId).select("organization").lean();
+    this.organization = user?.organization || null;
   }
 });
 
