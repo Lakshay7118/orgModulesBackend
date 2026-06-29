@@ -86,7 +86,7 @@ app.use("/api/groups", protect, requireModule("chat"), groupRoutes);
 app.use("/api/organizations", organizationRoutes);
 app.use("/api/dashboard", protect, dashboardRoutes);
 app.use("/api/tasks", protect, requireModule("task"), taskRoutes);
-app.use("/api/hr", protect, hrRoutes);
+app.use("/api/hr", protect, requireModule("hr"), hrRoutes);
 app.use(
   "/api/notifications",
   notificationRoutes

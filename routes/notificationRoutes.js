@@ -6,6 +6,18 @@ const Notification = require("../models/Notification");
 
 const protect = require("../middleware/authMiddleware");
 
+const notificationScope = (req, extra = {}) => {
+  const base = { userId: req.user.id, ...extra };
+  if (req.user.role === "super_to_super_admin") return base;
+  if (!req.user.organization) return { ...base, organization: null };
+  return {
+    ...base,
+    $or: [
+      { organization: req.user.organization },
+      { organization: null },
+    ],
+  };
+};
 
 // GET ALL
 router.get("/", protect, async (req, res) => {
@@ -13,9 +25,7 @@ router.get("/", protect, async (req, res) => {
   try {
 
     const notifications =
-      await Notification.find({
-        userId: req.user.id,
-      }).sort({
+      await Notification.find(notificationScope(req)).sort({
         createdAt: -1,
       });
 
@@ -40,10 +50,7 @@ router.patch("/:id/read", protect, async (req, res) => {
 
   try {
 
-    const notif =
-      await Notification.findById(
-        req.params.id
-      );
+    const notif = await Notification.findOne(notificationScope(req, { _id: req.params.id }));
 
     if (!notif) {
 
@@ -78,10 +85,7 @@ router.patch("/read-all/all", protect, async (req, res) => {
   try {
 
     await Notification.updateMany(
-      {
-        userId: req.user.id,
-        read: false,
-      },
+      notificationScope(req, { read: false }),
       {
         $set: {
           read: true,

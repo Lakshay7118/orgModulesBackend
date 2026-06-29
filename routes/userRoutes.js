@@ -14,6 +14,7 @@ const { getIO } = require("../sockets/socket");
 const { normalizeHrPermissions } = require("../utils/hrPermissions");
 
 const PUBLIC_USER_FIELDS = "name phone email role organization allowedModules hrPermissions isActive createdAt updatedAt";
+const hasHrModule = (req) => req.user.role === "super_to_super_admin" || (req.user.allowedModules || []).includes("hr");
 
 const emitNotification = (phone, notification) => {
   try {
@@ -21,12 +22,21 @@ const emitNotification = (phone, notification) => {
   } catch {}
 };
 
-const notifyAdmins = async (payload) => {
-  const admins = await User.find({ role: { $in: ["super_to_super_admin", "super_admin"] } }).select("_id phone").lean();
+const notifyAdmins = async (payload, { organization } = {}) => {
+  const query = organization
+    ? {
+        $or: [
+          { role: "super_to_super_admin" },
+          { role: "super_admin", organization },
+        ],
+      }
+    : { role: { $in: ["super_to_super_admin", "super_admin"] } };
+  const admins = await User.find(query).select("_id phone").lean();
   const notifications = await Promise.all(
     admins.map((admin) =>
       Notification.create({
         userId: admin._id,
+        organization: organization || null,
         ...payload,
       }).then((notification) => {
         if (admin.phone) emitNotification(admin.phone, notification);
@@ -101,6 +111,7 @@ const notifySupportStaff = async (payload, { organization, requesterRole } = {})
     staff.map((member) =>
       Notification.create({
         userId: member._id,
+        organization: organization || null,
         ...payload,
       }).then((notification) => {
         if (member.phone) emitNotification(member.phone, notification);
@@ -330,6 +341,8 @@ router.patch("/me", protect, async (req, res) => {
     await notifyAdmins({
       type: "profile_approval_requested",
       message: `${user.name || user.phone || "A user"} requested profile changes`,
+    }, {
+      organization: user.organization || req.user.organization,
     });
 
     res.status(202).json({ success: true, status: "pending", data: request });
@@ -374,9 +387,13 @@ router.patch("/me/password", protect, async (req, res) => {
 // =======================
 router.get("/profile-change-requests", protect, async (req, res) => {
   try {
-    const query = ["super_to_super_admin", "super_admin"].includes(req.user.role)
-      ? {}
-      : { requester: req.user.id };
+    let query = { requester: req.user.id };
+    if (req.user.role === "super_to_super_admin") {
+      query = {};
+    } else if (req.user.role === "super_admin") {
+      const orgUsers = req.user.organization ? await organizationUserIds(req.user.organization) : [req.user.id];
+      query = { requester: { $in: orgUsers } };
+    }
 
     const requests = await ProfileChangeRequest.find(query)
       .populate("requester", "name phone email role")
@@ -436,6 +453,7 @@ router.patch(
 
       const notification = await Notification.create({
         userId: request.requester._id,
+        organization: request.requester.organization || null,
         type: status === "approved" ? "profile_approved" : "profile_rejected",
         message: `Your profile change request was ${status}`,
       });
@@ -556,6 +574,7 @@ router.post(
 
       const notification = await Notification.create({
         userId: ticket.user._id,
+        organization: ticket.organization || ticket.user.organization || null,
         type: "support_ticket_replied",
         message: `Support replied to your ticket: ${ticket.subject}`,
       });
@@ -651,6 +670,7 @@ router.post(
 
       const notification = await Notification.create({
         userId: ticket.user._id,
+        organization: ticket.organization || ticket.user.organization || null,
         type: "support_ticket_replied",
         message: `Your password reset request was updated: ${ticket.subject}`,
       });
@@ -748,6 +768,9 @@ router.post(
       if (!creatableRoles[req.user.role]?.includes(targetRole)) {
         return res.status(403).json({ error: `${req.user.role} cannot create ${targetRole}` });
       }
+      if (targetRole === "hr" && !hasHrModule(req)) {
+        return res.status(403).json({ error: "Your organization does not have access to HR." });
+      }
 
       let user = await User.findOne({ email: email.toLowerCase() });
       if (user) return res.status(400).json({ error: "User already exists" });
@@ -769,7 +792,7 @@ router.post(
         role: targetRole,
         organization: req.user.organization,
         allowedModules,
-        hrPermissions: ["super_to_super_admin", "super_admin"].includes(req.user.role) && ["manager", "hr"].includes(targetRole)
+        hrPermissions: hasHrModule(req) && ["super_to_super_admin", "super_admin"].includes(req.user.role) && ["manager", "hr"].includes(targetRole)
           ? normalizeHrPermissions(req.body.hrPermissions)
           : undefined,
         createdBy: req.user.id,

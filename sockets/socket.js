@@ -145,14 +145,19 @@ const initSocket = (server) => {
     });
 
     socket.on("joinUserIdRoom", (userId) => {
-      if (userId) socket.join(userId.toString());
+      if (!userId || !socket.user?.id) return;
+      if (userId.toString() !== socket.user.id.toString()) return;
+      socket.join(socket.user.id.toString());
     });
 
     // ================= USER ONLINE =================
     socket.on("joinUserRoom", (userPhone) => {
+      if (!socket.user) return;
       if (!userPhone) return;
       const presenceKey = normalizePresenceKey(userPhone);
+      const ownPresenceKey = normalizePresenceKey(socket.user?.phone);
       if (!presenceKey) return;
+      if (!ownPresenceKey || presenceKey !== ownPresenceKey) return;
 
       // ❌ prevent duplicate join from same socket
       if (socket.userPhone === presenceKey) {

@@ -19,6 +19,9 @@ const User = require("../models/Users");
 const fullDashboardRoles = ["super_to_super_admin", "super_admin", "manager"];
 const money = (value) => Math.max(0, Math.round((Number(value) || 0) * 100) / 100);
 const hasFullDashboardAccess = (role) => fullDashboardRoles.includes(role);
+const canUseModule = (req, moduleName) =>
+  req.user.role === "super_to_super_admin" ||
+  (Array.isArray(req.user.allowedModules) && req.user.allowedModules.includes(moduleName));
 
 const organizationUserIds = async (organization) => {
   if (!organization) return [];
@@ -91,6 +94,19 @@ const scopedStaffFilter = async (req, filter = {}) => {
   return { $and: [{ $or: selfFilters }, filter] };
 };
 
+const scopedNotificationFilter = (req, filter = {}) => {
+  const base = { userId: req.user.id, ...filter };
+  if (req.user.role === "super_to_super_admin") return base;
+  if (!req.user.organization) return { ...base, organization: null };
+  return {
+    ...base,
+    $or: [
+      { organization: req.user.organization },
+      { organization: null },
+    ],
+  };
+};
+
 const scopedStaffLinkedFilter = async (req, field, filter = {}) => {
   if (hasFullDashboardAccess(req.user.role)) return scopedCreatorFilter(req, field, filter);
 
@@ -139,6 +155,7 @@ const taskActivityMeta = {
 router.get("/summary", async (req, res) => {
   try {
     const now = new Date();
+    const canViewHr = canUseModule(req, "hr");
     const [taskScope, approvedTaskScope, templateScope, campaignScope, contactScope, staffScope, departmentScope, bankScope, loanScope, payrollScope] = await Promise.all([
       scopedTaskFilter(req),
       scopedTaskFilter(req, { approvalStatus: "approved" }),
@@ -205,12 +222,12 @@ router.get("/summary", async (req, res) => {
       Chat.countDocuments(chatScope),
       Message.countDocuments(messageScope),
       req.user.role === "super_to_super_admin" ? Organization.countDocuments() : Promise.resolve(0),
-      HRStaff.countDocuments(staffScope),
-      HRDepartment.countDocuments(departmentScope),
-      HRBank.find(bankScope).select("balance").lean(),
-      HRLoan.find(loanScope).select("outstanding").lean(),
-      HRPayroll.find(payrollScope).select("balanceDue netPay").lean(),
-      Notification.find({ userId: req.user.id, type: { $in: taskActivityTypes } })
+      canViewHr ? HRStaff.countDocuments(staffScope) : Promise.resolve(0),
+      canViewHr ? HRDepartment.countDocuments(departmentScope) : Promise.resolve(0),
+      canViewHr ? HRBank.find(bankScope).select("balance").lean() : Promise.resolve([]),
+      canViewHr ? HRLoan.find(loanScope).select("outstanding").lean() : Promise.resolve([]),
+      canViewHr ? HRPayroll.find(payrollScope).select("balanceDue netPay").lean() : Promise.resolve([]),
+      Notification.find(scopedNotificationFilter(req, { type: { $in: taskActivityTypes } }))
         .select("type message taskId createdAt")
         .sort({ createdAt: -1 })
         .limit(8)

@@ -91,6 +91,7 @@ async function notifyAdmins({ type, message, templateId, organization }) {
   for (const admin of admins) {
     const notif = await Notification.create({
       userId: admin._id,
+      organization: organization || null,
       type,
       message,
       templateId,
@@ -100,10 +101,11 @@ async function notifyAdmins({ type, message, templateId, organization }) {
 }
 
 // ── Shared helper: notify a single user ─────────────────────────
-async function notifyUser({ userId, type, message, templateId }) {
+async function notifyUser({ userId, type, message, templateId, organization }) {
   const io = getIO();
   const notif = await Notification.create({
     userId,
+    organization: organization || null,
     type,
     message,
     templateId,
@@ -160,6 +162,7 @@ router.put(
         type: "template_approved",
         message: `Your template "${template.name}" was approved`,
         templateId: template._id,
+        organization: template.organization || req.user.organization || null,
       });
 
       res.json({ success: true, template });
@@ -197,6 +200,7 @@ router.put(
         type: "template_rejected",
         message: `Your template "${template.name}" was rejected`,
         templateId: template._id,
+        organization: template.organization || req.user.organization || null,
       });
 
       res.json({ success: true, template });

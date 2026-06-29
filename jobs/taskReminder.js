@@ -37,6 +37,7 @@ async function sendReminders() {
           type: "task_reminder",
           message: `Reminder: Task "${task.title}" is due soon.`,
           taskId: task._id,
+          organization: task.organization || null,
         });
         io.to(userId).emit("newNotification", notif);
         io.to(userId).emit("taskReminder", {

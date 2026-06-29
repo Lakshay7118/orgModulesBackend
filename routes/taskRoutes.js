@@ -115,6 +115,19 @@ const validateAssignedUsersInOrganization = async (req, assignedUserIds = []) =>
   return count === new Set(assignedUserIds.map((id) => id.toString())).size;
 };
 
+const notificationScope = (req, extra = {}) => {
+  const base = { userId: req.user.id, ...extra };
+  if (req.user.role === "super_to_super_admin") return base;
+  if (!req.user.organization) return { ...base, organization: null };
+  return {
+    ...base,
+    $or: [
+      { organization: req.user.organization },
+      { organization: null },
+    ],
+  };
+};
+
 const broadcastTaskAssignmentChanges = async (task, previousAssigneeIds, io) => {
   const newAssigneeIds = task.assignedTo.map((user) => user._id.toString());
   const removedAssigneeIds = previousAssigneeIds.filter((uid) => !newAssigneeIds.includes(uid));
@@ -141,6 +154,7 @@ const broadcastTaskAssignmentChanges = async (task, previousAssigneeIds, io) => 
       type: "task_assigned",
       message: `New task assigned: ${task.title}`,
       taskId: task._id,
+      organization: task.organization || null,
     });
     io.to(user._id.toString()).emit("newNotification", notif);
   }
@@ -301,6 +315,7 @@ router.post("/", protect, allowRoles("super_admin", "manager", "user"), async (r
           type: "task_assigned",
           message: `New task assigned: ${task.title}`,
           taskId: task._id,
+          organization: task.organization || null,
         });
         io.to(uid.toString()).emit("newNotification", notif);
         io.to(uid.toString()).emit("newTask", task);
@@ -316,6 +331,7 @@ router.post("/", protect, allowRoles("super_admin", "manager", "user"), async (r
           message: `${creator.name} submitted a task for approval: "${task.title}"`,
 
           taskId: task._id,
+          organization: task.organization || req.user.organization || null,
         });
         io.to(admin._id.toString()).emit("newNotification", notif);
         io.to(admin._id.toString()).emit("newTask", task);
@@ -373,6 +389,7 @@ router.patch("/:id/approve", protect, allowRoles("super_admin"), async (req, res
         type: "task_rejected",
         message: `Your edit request for "${task.title}" was rejected by admin`,
         taskId: task._id,
+        organization: task.organization || req.user.organization || null,
       });
       io.to(requesterId.toString()).emit("newNotification", notif);
       io.to(requesterId.toString()).emit("taskUpdated", populatedTask);
@@ -388,6 +405,7 @@ router.patch("/:id/approve", protect, allowRoles("super_admin"), async (req, res
         type: "task_rejected",
         message: `Your task "${task.title}" was rejected by admin`,
         taskId: task._id,
+        organization: task.organization || req.user.organization || null,
       });
       io.to(task.createdBy._id.toString()).emit("newNotification", notif);
       io.to(task.createdBy._id.toString()).emit("taskDeleted", { taskId: task._id });
@@ -424,6 +442,7 @@ router.patch("/:id/approve", protect, allowRoles("super_admin"), async (req, res
       type: "task_approved",
       message: isUpdateRequest ? `Your edit request for "${task.title}" was approved` : `Your task "${task.title}" was approved`,
       taskId: task._id,
+      organization: task.organization || req.user.organization || null,
     });
     io.to(task.createdBy._id.toString()).emit("newNotification", approvedNotif);
     io.to(task.createdBy._id.toString()).emit("taskUpdated", populatedTask);
@@ -444,6 +463,7 @@ router.patch("/:id/approve", protect, allowRoles("super_admin"), async (req, res
         type: "task_assigned",
         message: `New task assigned: ${task.title}`,
         taskId: task._id,
+        organization: task.organization || req.user.organization || null,
       });
       io.to(uid).emit("newNotification", notif);
       io.to(uid).emit("newTask", populatedTask);
@@ -525,6 +545,7 @@ router.put("/:id", protect, allowRoles("super_admin", "manager"), async (req, re
           type: "approval_requested",
           message: `${creator.name} submitted a task edit for approval: "${task.title}"`,
           taskId: task._id,
+          organization: task.organization || req.user.organization || null,
         });
         io.to(admin._id.toString()).emit("newNotification", notif);
         io.to(admin._id.toString()).emit("taskUpdated", populatedTask);
@@ -649,6 +670,7 @@ router.post("/:id/response", protect, async (req, res) => {
       type: "response_received",
       message: `${senderName} responded to task "${task.title}"`,  // ✅ fixed
       taskId: task._id,
+      organization: task.organization || req.user.organization || null,
     });
      io.to(task.createdBy.toString()).emit("newNotification", notif);
     io.to(task.createdBy.toString()).emit("taskResponse", populatedTask);
@@ -769,7 +791,7 @@ router.patch("/:id/status", protect, async (req, res) => {
 // =======================
 router.get("/notifications", protect, async (req, res) => {
   try {
-    const notifications = await Notification.find({ userId: req.user.id })
+    const notifications = await Notification.find(notificationScope(req))
       .populate("taskId", "title")
       .sort({ createdAt: -1 })
       .limit(50);
@@ -785,7 +807,7 @@ router.get("/notifications", protect, async (req, res) => {
 router.patch("/notifications/:id/read", protect, async (req, res) => {
   try {
     await Notification.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user.id },
+      notificationScope(req, { _id: req.params.id }),
       { read: true }
     );
     res.json({ success: true });
@@ -799,7 +821,7 @@ router.patch("/notifications/:id/read", protect, async (req, res) => {
 // =======================
 router.patch("/notifications/read-all", protect, async (req, res) => {
   try {
-    await Notification.updateMany({ userId: req.user.id }, { read: true });
+    await Notification.updateMany(notificationScope(req), { read: true });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });

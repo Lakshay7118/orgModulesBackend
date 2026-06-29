@@ -17,8 +17,9 @@ const sameId = (left, right) =>
   left && right && String(left) === String(right);
 
 const isTopAdmin = (role) => TOP_ADMIN_ROLES.includes(role);
+const hasHrModule = (req) => req.user.role === "super_to_super_admin" || (req.user.allowedModules || []).includes("hr");
 const canAssignHrPermissions = (req, targetRole) =>
-  isTopAdmin(req.user.role) && ["manager", "hr"].includes(targetRole);
+  hasHrModule(req) && isTopAdmin(req.user.role) && ["manager", "hr"].includes(targetRole);
 
 const creatableRolesByRole = {
   super_to_super_admin: ["super_admin", "manager", "hr", "user"],
@@ -32,6 +33,11 @@ const resolveCreatableRole = (req, requestedRole) => {
   const allowedRoles = creatableRolesByRole[req.user.role] || [];
   if (!allowedRoles.includes(role)) {
     const error = new Error(`${req.user.role} cannot create ${role}`);
+    error.statusCode = 403;
+    throw error;
+  }
+  if (role === "hr" && !hasHrModule(req)) {
+    const error = new Error("Your organization does not have access to HR.");
     error.statusCode = 403;
     throw error;
   }
@@ -168,14 +174,14 @@ async function notifyAdmins({ type, message, contactId, organization }) {
     : { role: { $in: TOP_ADMIN_ROLES } };
   const admins = await User.find(query).select("_id").lean();
   for (const admin of admins) {
-    const notif = await Notification.create({ userId: admin._id, type, message, contactId });
+    const notif = await Notification.create({ userId: admin._id, organization: organization || null, type, message, contactId });
     io.to(admin._id.toString()).emit("newNotification", notif);
   }
 }
 
-async function notifyUser({ userId, type, message, contactId }) {
+async function notifyUser({ userId, type, message, contactId, organization }) {
   const io = getIO();
-  const notif = await Notification.create({ userId, type, message, contactId });
+  const notif = await Notification.create({ userId, organization: organization || null, type, message, contactId });
   io.to(userId.toString()).emit("newNotification", notif);
 }
 
@@ -194,7 +200,7 @@ router.get("/contacts", protect, allowRoles("super_admin", "manager", "hr", "use
     const scopedContacts = await filterContactTagsForOrganization(req, contacts);
     const data = isTopAdmin(req.user.role) ? await attachLoginUsers(scopedContacts) : scopedContacts;
     res.json(hideSystemContacts(data));
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(err.statusCode || 500).json({ error: err.message }); }
 });
 
 // GET ALL MANAGERS
@@ -315,6 +321,7 @@ router.put("/contacts/:id/approve", protect, allowRoles("super_admin"), async (r
         type: "contact_approved",
         message: `Your contact "${contact.name || contact.mobile}" was approved`,
         contactId: contact._id,
+        organization: contact.organization || req.user.organization || null,
       });
     }
 
@@ -346,6 +353,7 @@ router.put("/contacts/:id/reject", protect, allowRoles("super_admin"), async (re
         type: "contact_rejected",
         message: `Your contact "${contact.name || contact.mobile}" was rejected`,
         contactId: contact._id,
+        organization: contact.organization || req.user.organization || null,
       });
     }
 
@@ -385,6 +393,9 @@ router.put("/contacts/:id", protect, allowRoles("super_admin", "manager"), async
     if (!contact.organization && req.user.organization) contact.organization = req.user.organization;
     if (role !== undefined) {
       if (!isTopAdmin(req.user.role)) return res.status(403).json({ error: "Only admins can change roles" });
+      if (role === "hr" && !hasHrModule(req)) {
+        return res.status(403).json({ error: "Your organization does not have access to HR." });
+      }
       contact.role = role;
     }
 

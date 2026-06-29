@@ -3,6 +3,12 @@ const mongoose = require("mongoose");
 const NotificationSchema = new mongoose.Schema(
   {
     userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    organization: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Organization",
+      default: null,
+      index: true,
+    },
     type: {
       type: String,
       enum: [
@@ -30,5 +36,20 @@ const NotificationSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+NotificationSchema.pre("validate", async function assignRecipientOrganization(next) {
+  try {
+    if (!this.organization && this.userId) {
+      const User = require("./Users");
+      const user = await User.findById(this.userId).select("organization").lean();
+      this.organization = user?.organization || null;
+    }
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+NotificationSchema.index({ userId: 1, organization: 1, createdAt: -1 });
 
 module.exports = mongoose.model("Notification", NotificationSchema);

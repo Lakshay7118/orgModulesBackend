@@ -95,14 +95,14 @@ async function notifyAdmins({ type, message, campaignId, organization }) {
     : { role: { $in: TOP_ADMIN_ROLES } };
   const admins = await User.find(query).select("_id").lean();
   for (const admin of admins) {
-    const notif = await Notification.create({ userId: admin._id, type, message, campaignId });
+    const notif = await Notification.create({ userId: admin._id, organization: organization || null, type, message, campaignId });
     io.to(admin._id.toString()).emit("newNotification", notif);
   }
 }
 
-async function notifyUser({ userId, type, message, campaignId }) {
+async function notifyUser({ userId, type, message, campaignId, organization }) {
   const io = getIO();
-  const notif = await Notification.create({ userId, type, message, campaignId });
+  const notif = await Notification.create({ userId, organization: organization || null, type, message, campaignId });
   io.to(userId.toString()).emit("newNotification", notif);
 }
 
@@ -163,6 +163,7 @@ router.put("/campaigns/:id/approve", protect, allowRoles("super_admin"), async (
       type: "campaign_approved",
       message: `Your campaign "${campaign.campaignName}" was approved and is now scheduled`,
       campaignId: campaign._id,
+      organization: campaign.organization || req.user.organization || null,
     });
 
     res.json({ success: true, campaign });
@@ -190,6 +191,7 @@ router.put("/campaigns/:id/reject", protect, allowRoles("super_admin"), async (r
       type: "campaign_rejected",
       message: `Your campaign "${campaign.campaignName}" was rejected`,
       campaignId: campaign._id,
+      organization: campaign.organization || req.user.organization || null,
     });
 
     res.json({ success: true, campaign });
