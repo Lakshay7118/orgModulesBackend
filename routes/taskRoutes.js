@@ -5,6 +5,7 @@ const Notification = require("../models/Notification");
 const User = require("../models/Users");
 const { getIO } = require("../sockets/socket");
 const UserTaskStatus = require("../models/UserTaskStatus");
+const TaskResponseSeen = require("../models/TaskResponseSeen");
 const protect = require("../middleware/authMiddleware");
 const allowRoles = require("../middleware/roleMiddleware");
 
@@ -139,6 +140,10 @@ const broadcastTaskAssignmentChanges = async (task, previousAssigneeIds, io) => 
 
   if (removedAssigneeIds.length > 0) {
     await UserTaskStatus.deleteMany({
+      taskId: task._id,
+      userId: { $in: removedAssigneeIds },
+    });
+    await TaskResponseSeen.deleteMany({
       taskId: task._id,
       userId: { $in: removedAssigneeIds },
     });
@@ -727,6 +732,59 @@ router.delete("/:id/response/:responseId", protect, async (req, res) => {
     });
 
     res.json({ success: true, data: populatedTask });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// =======================
+// TASK RESPONSE SEEN STATE
+// =======================
+router.get("/response-seens", protect, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const userRole = req.user.role;
+
+    let roleFilter = {};
+    if (!isTopAdmin(userRole)) {
+      roleFilter = userRole === "manager"
+        ? { $or: [{ createdBy: userId }, { assignedTo: userId }] }
+        : { assignedTo: userId };
+    }
+
+    const taskFilter = andFilters(await taskOrganizationScope(req), roleFilter);
+    const visibleTaskIds = (await Task.find(taskFilter).select("_id").lean()).map((task) => task._id);
+    const seens = await TaskResponseSeen.find({
+      userId,
+      taskId: { $in: visibleTaskIds },
+    }).lean();
+
+    res.json({ success: true, data: seens });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.patch("/:id/responses/seen", protect, async (req, res) => {
+  try {
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!(await ensureTaskOrganizationAccess(req, task, res))) return;
+
+    const isAssignee = task.assignedTo.some((id) => id.toString() === req.user.id);
+    const isCreator = task.createdBy.toString() === req.user.id;
+    const isAdmin = isTopAdmin(req.user.role);
+    if (!isAssignee && !isCreator && !isAdmin) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+
+    const record = await TaskResponseSeen.findOneAndUpdate(
+      { userId: req.user.id, taskId: task._id },
+      { seenAt: new Date() },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    ).lean();
+
+    res.json({ success: true, data: record });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
